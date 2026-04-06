@@ -5,6 +5,9 @@ Runs all pollers on their schedules:
 - stats_poller: every 6 hours
 - delivery_poller: every 2 hours
 - notifier: every 15 minutes
+
+NOTE: The action API server must be run separately:
+  uvicorn api.main:app --host 0.0.0.0 --port 8000
 """
 
 import logging
