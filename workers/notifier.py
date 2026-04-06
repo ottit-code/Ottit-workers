@@ -8,54 +8,12 @@ Supabase Realtime then pushes changes to the dashboard.
 import logging
 import os
 import smtplib
-import json
 from datetime import date
 from email.mime.text import MIMEText
 from lib.supabase_client import get_supabase
-from lib import config
+from lib.notifications import create_notification
 
 logger = logging.getLogger(__name__)
-
-
-def _create_notification(severity: str, type_: str, title: str, body: str,
-                          entity_type: str = None, entity_id: str = None) -> None:
-    """Write a notification row to Supabase."""
-    supabase = get_supabase()
-    row = {
-        "severity": severity,
-        "type": type_,
-        "title": title,
-        "body": body,
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "read": False,
-    }
-    try:
-        supabase.table("notifications").insert(row).execute()
-        logger.info(f"Created notification: [{severity}] {title}")
-        if severity == "critical" and config.SLACK_WEBHOOK_URL:
-            _send_slack(title, body, severity)
-    except Exception as e:
-        logger.error(f"Failed to create notification: {e}")
-
-
-def _send_slack(title: str, body: str, severity: str) -> None:
-    """Post a critical alert to Slack."""
-    import urllib.request
-    emoji = {"critical": "🔴", "warning": "🟠", "info": "🟡", "resolved": "✅"}.get(severity, "ℹ️")
-    payload = json.dumps({
-        "text": f"{emoji} *{title}*\n{body}"
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        config.SLACK_WEBHOOK_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        logger.error(f"Slack notification failed: {e}")
 
 
 def _already_notified_today(type_: str, entity_id: str = None) -> bool:
@@ -83,7 +41,7 @@ def check_bounce_rate_spike() -> None:
                 entity_id = str(row["sender_email_id"])
                 if not _already_notified_today("bounce_spike", entity_id):
                     pct = f"{(bounced/sent*100):.1f}%"
-                    _create_notification(
+                    create_notification(
                         severity="warning",
                         type_="bounce_spike",
                         title=f"High bounce rate: {row.get('sender_email', entity_id)}",
@@ -109,7 +67,7 @@ def check_daily_limit_approaching() -> None:
                 entity_id = str(row["sender_email_id"])
                 if not _already_notified_today("daily_limit_approaching", entity_id):
                     pct = f"{(sent/limit*100):.0f}%"
-                    _create_notification(
+                    create_notification(
                         severity="info",
                         type_="daily_limit_approaching",
                         title=f"Sender near daily limit: {row.get('sender_email', entity_id)}",
@@ -133,7 +91,7 @@ def check_spam_score() -> None:
             if score > 5.0:
                 entity_id = row.get("eg_test_uuid", "")
                 if not _already_notified_today("spam_score_high", entity_id):
-                    _create_notification(
+                    create_notification(
                         severity="warning",
                         type_="spam_score_high",
                         title=f"High spam score: {row.get('domain', 'unknown')}",

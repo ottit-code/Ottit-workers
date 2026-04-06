@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from lib import emailbison, emailguard, config
 from lib.supabase_client import get_supabase
 from api.logging_utils import log_action
-from workers.notifier import _create_notification
+from lib.notifications import create_notification
 
 app = FastAPI(title="Ottit CRM API", version="1.0.0")
 
@@ -101,7 +101,7 @@ def handle_email_sent(payload: dict) -> None:
 
 
 def handle_lead_replied(payload: dict) -> None:
-    _create_notification(
+    create_notification(
         severity="info",
         type_="lead_replied",
         title="New lead reply",
@@ -112,7 +112,7 @@ def handle_lead_replied(payload: dict) -> None:
 
 
 def handle_lead_interested(payload: dict) -> None:
-    _create_notification(
+    create_notification(
         severity="info",
         type_="lead_interested",
         title="Lead marked as interested",
@@ -129,7 +129,7 @@ def handle_email_bounced(payload: dict) -> None:
 def handle_account_disconnected(payload: dict) -> None:
     account = payload.get("email_account", {})
     email = account.get("email", "unknown")
-    _create_notification(
+    create_notification(
         severity="critical",
         type_="account_disconnected",
         title=f"Sender disconnected: {email}",
@@ -142,7 +142,7 @@ def handle_account_disconnected(payload: dict) -> None:
 def handle_account_reconnected(payload: dict) -> None:
     account = payload.get("email_account", {})
     email = account.get("email", "unknown")
-    _create_notification(
+    create_notification(
         severity="resolved",
         type_="account_reconnected",
         title=f"Sender reconnected: {email}",
