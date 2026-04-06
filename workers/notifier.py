@@ -79,7 +79,8 @@ def check_bounce_rate_spike() -> None:
             sent = row.get("emails_sent", 0) or 0
             bounced = row.get("emails_bounced", 0) or 0
             if sent > 0 and bounced / sent > 0.05:
-                entity_id = row["sender_email_id"]
+                # sender_email_id is integer in schema; convert to str for entity_id
+                entity_id = str(row["sender_email_id"])
                 if not _already_notified_today("bounce_spike", entity_id):
                     pct = f"{(bounced/sent*100):.1f}%"
                     _create_notification(
@@ -104,7 +105,8 @@ def check_daily_limit_approaching() -> None:
             limit = row.get("daily_limit", 0) or 0
             sent = row.get("emails_sent", 0) or 0
             if limit > 0 and sent / limit >= 0.9:
-                entity_id = row["sender_email_id"]
+                # sender_email_id is integer in schema; convert to str for entity_id
+                entity_id = str(row["sender_email_id"])
                 if not _already_notified_today("daily_limit_approaching", entity_id):
                     pct = f"{(sent/limit*100):.0f}%"
                     _create_notification(
@@ -129,7 +131,7 @@ def check_spam_score() -> None:
         for row in result.data:
             score = row.get("score") or 0
             if score > 5.0:
-                entity_id = row.get("external_uuid", "")
+                entity_id = row.get("eg_test_uuid", "")
                 if not _already_notified_today("spam_score_high", entity_id):
                     _create_notification(
                         severity="warning",

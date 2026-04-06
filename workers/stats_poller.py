@@ -6,7 +6,7 @@ Also fetches campaign event stats.
 """
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from lib import emailbison
 from lib.supabase_client import get_supabase
 
@@ -26,16 +26,24 @@ def poll_sender_stats() -> None:
         domain = email.split("@")[1] if "@" in email else ""
 
         row = {
-            "sender_email_id": str(sender.get("id", "")),
+            "sender_email_id": int(sender.get("id", 0)),
             "sender_email": email,
             "domain": domain,
             "stat_date": today,
             "emails_sent": sender.get("emails_sent_count", 0) or 0,
+            "emails_opened": sender.get("emails_opened_count", 0) or 0,
+            "emails_replied": sender.get("emails_replied_count", 0) or 0,
             "emails_bounced": sender.get("bounced_count", 0) or 0,
+            "warmup_sent": sender.get("warmup_sent_count", 0) or 0,
+            "warmup_replied": sender.get("warmup_replied_count", 0) or 0,
             "daily_limit": sender.get("daily_limit", 0) or 0,
             "warmup_enabled": bool(sender.get("warmup_enabled", False)),
+            "fetched_at": datetime.utcnow().isoformat(),
         }
 
+        # Note: upsert requires unique constraint on (sender_email_id, stat_date).
+        # Add via Supabase dashboard if not already present:
+        #   CREATE UNIQUE INDEX ON sender_daily_stats(sender_email_id, stat_date);
         try:
             supabase.table("sender_daily_stats").upsert(
                 row, on_conflict="sender_email_id,stat_date"
