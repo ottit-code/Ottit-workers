@@ -15,17 +15,17 @@ logger = logging.getLogger(__name__)
 
 
 def poll_placement_tests() -> None:
-    """Upsert inbox placement tests; for completed tests, write per-email child rows."""
+    """Batch-upsert inbox placement tests; for completed tests, batch-write per-email child rows."""
     supabase = get_supabase()
     tests = emailguard.get_inbox_placement_tests()
     logger.info(f"Polling {len(tests)} placement tests")
 
+    parent_rows = []
     for test in tests:
         uuid = test.get("uuid") or test.get("id", "")
         if not uuid:
             continue
-
-        row = {
+        parent_rows.append({
             "eg_test_uuid": str(uuid),
             "domain": test.get("domain") or "",
             "sender_email_id": int(test.get("sender_email_id", 0)),
@@ -36,69 +36,74 @@ def poll_placement_tests() -> None:
             "completed_at": test.get("completed_at"),
             "overall_score": test.get("overall_score"),
             "passed": test.get("passed"),
-        }
+        })
 
-        try:
-            supabase.table("domain_placement_tests").upsert(
-                row, on_conflict="eg_test_uuid"
-            ).execute()
-        except Exception as e:
-            logger.error(f"Failed to upsert placement test {uuid}: {e}")
+    if not parent_rows:
+        return
+
+    try:
+        result = supabase.table("domain_placement_tests").upsert(
+            parent_rows, on_conflict="eg_test_uuid", returning="representation"
+        ).execute()
+        # Build a map of eg_test_uuid → internal id from the returned rows
+        uuid_to_id = {row["eg_test_uuid"]: row["id"] for row in (result.data or [])}
+        logger.info(f"Batch-upserted {len(parent_rows)} placement tests")
+    except Exception as e:
+        logger.error(f"Failed to batch-upsert placement tests: {e}")
+        return
+
+    # For completed tests, fetch full details and collect all child email rows
+    child_rows = []
+    for test in tests:
+        uuid = str(test.get("uuid") or test.get("id", ""))
+        if test.get("status") != "completed" or not uuid:
             continue
 
-        # If completed, fetch full test and write child rows
-        if test.get("status") == "completed":
-            try:
-                full_test = emailguard.get_inbox_placement_test(str(uuid))
-                emails = full_test.get("inbox_placement_test_emails") or []
+        test_id = uuid_to_id.get(uuid)
+        if not test_id:
+            continue
 
-                # Get the internal Supabase id
-                existing = supabase.table("domain_placement_tests").select("id").eq(
-                    "eg_test_uuid", str(uuid)
-                ).single().execute()
-                test_id = existing.data["id"] if existing.data else None
+        try:
+            full_test = emailguard.get_inbox_placement_test(uuid)
+            emails = full_test.get("inbox_placement_test_emails") or []
+            for email_item in emails:
+                eg_email_uuid = str(email_item.get("uuid") or email_item.get("id", ""))
+                if not eg_email_uuid:
+                    logger.warning(f"placement_test_email missing uuid for test {uuid}, skipping")
+                    continue
+                child_rows.append({
+                    "placement_test_id": test_id,
+                    "eg_email_uuid": eg_email_uuid,
+                    "email": email_item.get("email") or "",
+                    "provider": email_item.get("provider"),
+                    "status": email_item.get("status"),
+                    "folder": email_item.get("folder"),
+                })
+        except Exception as e:
+            logger.error(f"Failed to fetch placement test emails for {uuid}: {e}")
 
-                if test_id and emails:
-                    for email_item in emails:
-                        eg_email_uuid = str(
-                            email_item.get("uuid") or email_item.get("id", "")
-                        )
-                        if not eg_email_uuid:
-                            logger.warning(
-                                f"placement_test_email missing uuid for test {uuid}, skipping"
-                            )
-                            continue
-                        child = {
-                            "placement_test_id": test_id,
-                            "eg_email_uuid": eg_email_uuid,
-                            "email": email_item.get("email") or "",
-                            "provider": email_item.get("provider"),
-                            "status": email_item.get("status"),
-                            # folder is "inbox", "spam", "promotions" as a string
-                            "folder": email_item.get("folder"),
-                        }
-                        supabase.table("placement_test_emails").upsert(
-                            child, on_conflict="eg_email_uuid"
-                        ).execute()
-
-                    logger.debug(f"Wrote {len(emails)} email rows for test {uuid}")
-
-            except Exception as e:
-                logger.error(f"Failed to fetch/write placement test emails for {uuid}: {e}")
+    if child_rows:
+        try:
+            supabase.table("placement_test_emails").upsert(
+                child_rows, on_conflict="eg_email_uuid"
+            ).execute()
+            logger.info(f"Batch-upserted {len(child_rows)} placement test email rows")
+        except Exception as e:
+            logger.error(f"Failed to batch-upsert placement test emails: {e}")
 
 
 def poll_spam_filter_tests() -> None:
-    """Upsert spam filter tests into spam_filter_tests."""
+    """Batch-upsert spam filter tests into spam_filter_tests."""
     supabase = get_supabase()
     tests = emailguard.get_spam_filter_tests()
     logger.info(f"Polling {len(tests)} spam filter tests")
 
+    rows = []
     for test in tests:
         uuid = test.get("uuid") or test.get("id", "")
         if not uuid:
             continue
-
-        row = {
+        rows.append({
             "eg_test_uuid": str(uuid),
             "sender_email_id": int(test.get("sender_email_id", 0)) if test.get("sender_email_id") else None,
             "sender_email": test.get("sender_email"),
@@ -111,33 +116,34 @@ def poll_spam_filter_tests() -> None:
             "triggered_by": "delivery_poller",
             "created_at": test.get("created_at"),
             "completed_at": test.get("completed_at"),
-        }
+        })
 
+    if rows:
         try:
             supabase.table("spam_filter_tests").upsert(
-                row, on_conflict="eg_test_uuid"
+                rows, on_conflict="eg_test_uuid"
             ).execute()
+            logger.info(f"Batch-upserted {len(rows)} spam filter tests")
         except Exception as e:
-            logger.error(f"Failed to upsert spam filter test {uuid}: {e}")
+            logger.error(f"Failed to batch-upsert spam filter tests: {e}")
 
 
 def poll_surbl_checks() -> None:
-    """Upsert SURBL blacklist check results into surbl_checks."""
+    """Batch-upsert SURBL blacklist check results into surbl_checks."""
     supabase = get_supabase()
     checks = emailguard.get_surbl_checks()
     logger.info(f"Polling {len(checks)} SURBL checks")
 
+    rows = []
     for check in checks:
         domain = check.get("domain", "")
         if not domain:
             continue
-
         eg_uuid = check.get("uuid") or check.get("id", "")
         if not eg_uuid:
             logger.warning(f"SURBL check missing uuid, skipping: {check}")
             continue
-
-        row = {
+        rows.append({
             "eg_check_uuid": str(eg_uuid),
             "domain": domain,
             "status": check.get("status"),
@@ -145,14 +151,16 @@ def poll_surbl_checks() -> None:
             "triggered_by": "delivery_poller",
             "created_at": check.get("created_at"),
             "completed_at": check.get("completed_at"),
-        }
+        })
 
+    if rows:
         try:
             supabase.table("surbl_checks").upsert(
-                row, on_conflict="eg_check_uuid"
+                rows, on_conflict="eg_check_uuid"
             ).execute()
+            logger.info(f"Batch-upserted {len(rows)} SURBL checks")
         except Exception as e:
-            logger.error(f"Failed to upsert SURBL check for {domain}: {e}")
+            logger.error(f"Failed to batch-upsert SURBL checks: {e}")
 
 
 def run() -> None:

@@ -1,32 +1,37 @@
 """
 stats_poller.py — runs every 6 hours
 
-Fetches sender email stats from EmailBison and upserts into sender_daily_stats.
-Also fetches campaign event stats.
+Fetches data from EmailBison and upserts into Supabase:
+- sender_daily_stats: per-sender email stats
+- workspace_daily_stats: workspace-wide chart data
 """
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from lib import emailbison
 from lib.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
 
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def poll_sender_stats() -> None:
-    """Fetch all sender emails and upsert today's stats into sender_daily_stats."""
+    """Fetch all sender emails and batch-upsert today's stats into sender_daily_stats."""
     supabase = get_supabase()
-    today = date.today().isoformat()
+    today = _today()
 
     senders = emailbison.get_sender_emails()
     logger.info(f"Polling stats for {len(senders)} senders")
 
+    rows = []
     for sender in senders:
         email = sender.get("email", "")
         domain = email.split("@")[1] if "@" in email else ""
-
-        row = {
-            "sender_email_id": int(sender.get("id", 0)),
+        rows.append({
+            "sender_email_id": int(sender.get("id") or 0),
             "sender_email": email,
             "domain": domain,
             "stat_date": today,
@@ -38,47 +43,77 @@ def poll_sender_stats() -> None:
             "warmup_replied": sender.get("warmup_replied_count", 0) or 0,
             "daily_limit": sender.get("daily_limit", 0) or 0,
             "warmup_enabled": bool(sender.get("warmup_enabled", False)),
-            "fetched_at": datetime.utcnow().isoformat(),
-        }
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        })
 
-        # Note: upsert requires unique constraint on (sender_email_id, stat_date).
-        # Add via Supabase dashboard if not already present:
-        #   CREATE UNIQUE INDEX ON sender_daily_stats(sender_email_id, stat_date);
+    if rows:
         try:
             supabase.table("sender_daily_stats").upsert(
-                row, on_conflict="sender_email_id,stat_date"
+                rows, on_conflict="sender_email_id,stat_date"
             ).execute()
-            logger.debug(f"Upserted stats for {email}")
+            logger.info(f"Batch-upserted stats for {len(rows)} senders")
         except Exception as e:
-            logger.error(f"Failed to upsert stats for {email}: {e}")
+            logger.error(f"Failed to batch-upsert sender stats: {e}")
 
 
-def poll_campaign_event_stats() -> None:
-    """Fetch campaign event stats for the last 30 days."""
-    end_date = date.today().isoformat()
-    start_date = (date.today() - timedelta(days=30)).isoformat()
+def poll_workspace_stats() -> None:
+    """
+    Fetch workspace chart stats from EmailBison and batch-upsert into workspace_daily_stats.
+    One row per date with individual metric columns. Backfills the last 30 days on each run.
+    """
+    supabase = get_supabase()
+    today = datetime.now(timezone.utc).date()
+    end_date = today.isoformat()
+    start_date = (today - timedelta(days=30)).isoformat()
 
     try:
-        stats = emailbison.get_campaign_events_stats(start_date, end_date)
-        logger.info(f"Fetched campaign event stats: {type(stats)}")
-        # Stats are stored for future use; the frontend reads sender_daily_stats
+        stats = emailbison.get_workspace_chart_stats(start_date, end_date)
+        series = stats.get("data", [])
+
+        label_to_col = {
+            "Sent": "emails_sent",
+            "Total Opens": "emails_opened",
+            "Replied": "emails_replied",
+            "Bounced": "emails_bounced",
+            "Unsubscribed": "unsubscribed",
+            "Interested": "interested",
+        }
+
+        by_date: dict = {}
+        for item in series:
+            col = label_to_col.get(item.get("label", ""))
+            if not col:
+                continue
+            for date_str, count in item.get("dates", []):
+                if date_str not in by_date:
+                    by_date[date_str] = {
+                        "emails_sent": 0, "emails_opened": 0, "emails_replied": 0,
+                        "emails_bounced": 0, "unsubscribed": 0, "interested": 0,
+                    }
+                by_date[date_str][col] = count or 0
+
+        if by_date:
+            fetched_at = datetime.now(timezone.utc).isoformat()
+            rows = [
+                {"stat_date": date_str, "fetched_at": fetched_at, **metrics}
+                for date_str, metrics in by_date.items()
+            ]
+            supabase.table("workspace_daily_stats").upsert(
+                rows, on_conflict="stat_date"
+            ).execute()
+            logger.info(f"Batch-upserted workspace stats for {len(rows)} dates")
     except Exception as e:
-        logger.error(f"Failed to fetch campaign event stats: {e}")
+        logger.error(f"Failed to fetch/store workspace chart stats: {e}")
 
 
 def run() -> None:
     """Main entry point called by the scheduler."""
     logger.info("Starting stats poll")
-    try:
-        poll_sender_stats()
-    except Exception as e:
-        logger.error(f"stats_poller.poll_sender_stats failed: {e}")
-
-    try:
-        poll_campaign_event_stats()
-    except Exception as e:
-        logger.error(f"stats_poller.poll_campaign_event_stats failed: {e}")
-
+    for fn in [poll_sender_stats, poll_workspace_stats]:
+        try:
+            fn()
+        except Exception as e:
+            logger.error(f"stats_poller.{fn.__name__} failed: {e}")
     logger.info("Stats poll complete")
 
 

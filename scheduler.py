@@ -31,10 +31,14 @@ def main():
     delivery_poller.run()
     notifier.run()
 
-    # Schedule recurring jobs
-    scheduler.add_job(stats_poller.run, "interval", hours=6, id="stats_poller")
-    scheduler.add_job(delivery_poller.run, "interval", hours=2, id="delivery_poller")
-    scheduler.add_job(notifier.run, "interval", minutes=15, id="notifier")
+    # Schedule recurring jobs — max_instances=1 + coalesce prevent stacked runs
+    # if a job takes longer than its interval.
+    scheduler.add_job(stats_poller.run, "interval", hours=6,
+                      id="stats_poller", max_instances=1, coalesce=True)
+    scheduler.add_job(delivery_poller.run, "interval", hours=2,
+                      id="delivery_poller", max_instances=1, coalesce=True)
+    scheduler.add_job(notifier.run, "interval", minutes=15,
+                      id="notifier", max_instances=1, coalesce=True)
 
     logger.info("Scheduler started")
     try:

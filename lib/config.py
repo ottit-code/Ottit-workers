@@ -10,7 +10,16 @@ EMAILGUARD_API_TOKEN = os.environ["EMAILGUARD_API_TOKEN"]
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 SMTP_FROM = os.getenv("SMTP_FROM", "")
+
+# API auth — if unset, auth is skipped (dev mode)
+API_KEY = os.getenv("API_KEY", "")
+# Comma-separated allowed origins for CORS, e.g. "https://app.ottit.com,http://localhost:3000"
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+try:
+    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+except ValueError:
+    SMTP_PORT = 587

@@ -1,0 +1,439 @@
+{
+  "info": {
+    "name": "Ottit CRM API",
+    "description": "Full API collection for Ottit CRM backend.\n\n**Base URL:** `http://localhost:8000`\n\n**Auth:** Set `apiKey` variable. All endpoints except `/health` and `/webhook` require `Authorization: Bearer {{apiKey}}`.\n\nLeave `apiKey` empty in dev mode (auth is skipped when `API_KEY` env var is unset).\n\n**Data sources:**\n- Stats, senders, deliverability, notifications → Supabase (kept fresh by pollers)\n- Campaigns, leads, replies → EmailBison (live, fetched per request)\n- Write/action endpoints → EmailBison / EmailGuard (proxied, logged to `dashboard_action_log`)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8000", "type": "string" },
+    { "key": "apiKey",  "value": "",                      "type": "string" }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{apiKey}}", "type": "string" }]
+  },
+  "item": [
+
+    {
+      "name": "System",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] },
+            "description": "Pings Supabase, EmailBison, and EmailGuard. Returns `status: ok` or `degraded` with per-service details. No auth required."
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Stats & Overview",
+      "item": [
+        {
+          "name": "Workspace stats",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/stats?days=30",
+              "host": ["{{baseUrl}}"],
+              "path": ["stats"],
+              "query": [{ "key": "days", "value": "30", "description": "Number of days to aggregate (default: 30)" }]
+            },
+            "description": "Workspace-level email metrics from `workspace_daily_stats` (written by stats_poller every 6h). Returns totals + per-day breakdown.\n\nFields: `emails_sent`, `emails_opened`, `emails_replied`, `emails_bounced`, `unsubscribed`, `interested`."
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Senders",
+      "description": "Source: `sender_daily_stats` (Supabase). Updated every 6h by stats_poller. Falls back to most recent available date per sender via the `get_latest_sender_stats` Postgres RPC (DISTINCT ON) if today has no data yet.",
+      "item": [
+        {
+          "name": "List senders",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/senders",
+              "host": ["{{baseUrl}}"],
+              "path": ["senders"],
+              "query": [
+                { "key": "domain",         "value": "",     "description": "Filter by domain (e.g. ottitcfo.info)", "disabled": true },
+                { "key": "warmup_enabled", "value": "true", "description": "Filter by warmup status (true/false)",  "disabled": true }
+              ]
+            },
+            "description": "Latest stats per sender. Returns full `sender_daily_stats` rows including `emails_sent`, `emails_replied`, `emails_bounced`, `warmup_enabled`, `daily_limit`, `domain`, `stat_date`."
+          }
+        },
+        {
+          "name": "Sender history",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/senders/7953/history?days=30",
+              "host": ["{{baseUrl}}"],
+              "path": ["senders", "7953", "history"],
+              "query": [{ "key": "days", "value": "30", "description": "How many days back (default: 30)" }]
+            },
+            "description": "Time-series stats for a single sender. Replace `7953` with the `sender_email_id`. Returns rows ordered by `stat_date` ascending."
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Campaigns",
+      "description": "Source: EmailBison (live, fetched per request). Fields: `campaign_id`, `campaign_name`, `campaign_status`, `emails_sent_count`, `reply_count`, `bounced_count`, `total_leads`, `completion_percentage`, `created_at`.",
+      "item": [
+        {
+          "name": "List campaigns",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/campaigns",
+              "host": ["{{baseUrl}}"],
+              "path": ["campaigns"],
+              "query": [
+                { "key": "status", "value": "active", "description": "Filter by status: active | paused | archived | completed", "disabled": true }
+              ]
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Leads & Replies",
+      "description": "Source: EmailBison (live). No Supabase table yet — these hit the external API on every request.",
+      "item": [
+        {
+          "name": "List leads",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/leads",
+              "host": ["{{baseUrl}}"],
+              "path": ["leads"],
+              "query": [
+                { "key": "campaign_id", "value": "394", "description": "Filter by campaign ID", "disabled": true }
+              ]
+            },
+            "description": "Returns: `id`, `email`, `first_name`, `last_name`, `company`, `status`, `campaign_id`, `created_at`."
+          }
+        },
+        {
+          "name": "List replies",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/replies",
+              "host": ["{{baseUrl}}"],
+              "path": ["replies"],
+              "query": [
+                { "key": "campaign_id", "value": "394", "description": "Filter by campaign ID", "disabled": true }
+              ]
+            },
+            "description": "Returns: `id`, `lead_email`, `from_name`, `subject`, `campaign_id`, `body`, `created_at`, `interested`."
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Deliverability",
+      "description": "Read endpoints pull from Supabase (written by delivery_poller every 2h). Write endpoints trigger new tests via EmailGuard.",
+      "item": [
+        {
+          "name": "Domain health (aggregated)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/deliverability/domain-health",
+              "host": ["{{baseUrl}}"],
+              "path": ["deliverability", "domain-health"],
+              "query": [
+                { "key": "domain", "value": "ottitcfo.info", "description": "Filter to a specific domain", "disabled": true }
+              ]
+            },
+            "description": "Source: `v_domain_health` view. Aggregates placement test results per domain. Fields: `domain`, `total_tests`, `avg_score`, `passed_count`, `failed_count`, `last_tested_at`, `latest_score`, `latest_passed`, `latest_status`."
+          }
+        },
+        {
+          "name": "Placement tests",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/deliverability/placement-tests",
+              "host": ["{{baseUrl}}"],
+              "path": ["deliverability", "placement-tests"],
+              "query": [
+                { "key": "domain",  "value": "",         "description": "Filter by domain",            "disabled": true },
+                { "key": "status",  "value": "completed","description": "pending | completed | failed", "disabled": true },
+                { "key": "limit",   "value": "50",       "description": "Max results (default: 50)" }
+              ]
+            },
+            "description": "Source: `domain_placement_tests` joined with `placement_test_emails`. Includes per-inbox-provider results for completed tests."
+          }
+        },
+        {
+          "name": "Spam filter tests",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/deliverability/spam-tests",
+              "host": ["{{baseUrl}}"],
+              "path": ["deliverability", "spam-tests"],
+              "query": [
+                { "key": "domain",       "value": "",    "description": "Filter by domain",        "disabled": true },
+                { "key": "sender_email", "value": "",    "description": "Filter by sender email",  "disabled": true },
+                { "key": "limit",        "value": "50",  "description": "Max results (default: 50)" }
+              ]
+            },
+            "description": "Source: `spam_filter_tests`. Fields: `eg_test_uuid`, `sender_email`, `domain`, `status`, `score`, `score_breakdown` (JSONB), `sent_from`, `sending_server_ip`, `created_at`, `completed_at`."
+          }
+        },
+        {
+          "name": "SURBL blacklist checks",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/deliverability/surbl-checks",
+              "host": ["{{baseUrl}}"],
+              "path": ["deliverability", "surbl-checks"],
+              "query": [
+                { "key": "domain", "value": "",      "description": "Filter by domain",                "disabled": true },
+                { "key": "listed", "value": "false", "description": "Filter listed/unlisted (true/false)", "disabled": true },
+                { "key": "limit",  "value": "50",    "description": "Max results (default: 50)" }
+              ]
+            },
+            "description": "Source: `surbl_checks`. Fields: `eg_check_uuid`, `domain`, `status`, `listed`, `triggered_by`, `created_at`, `completed_at`."
+          }
+        },
+        {
+          "name": "Trigger placement test",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/deliverability/placement-test", "host": ["{{baseUrl}}"], "path": ["actions", "deliverability", "placement-test"] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"ottitcfo.info\",\n  \"sender_email\": \"azi@ottitcfo.info\"\n}"
+            },
+            "description": "Triggers a new inbox placement test via EmailGuard. Results appear in `domain_placement_tests` on next delivery_poller run (every 2h) or when the test completes."
+          }
+        },
+        {
+          "name": "Trigger spam test",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/deliverability/spam-test", "host": ["{{baseUrl}}"], "path": ["actions", "deliverability", "spam-test"] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"ottitcfo.info\",\n  \"sender_email\": \"azi@ottitcfo.info\"\n}"
+            },
+            "description": "Triggers a spam filter test via EmailGuard. Score appears in `spam_filter_tests` on next delivery_poller run."
+          }
+        },
+        {
+          "name": "Trigger SURBL check",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/deliverability/surbl-check", "host": ["{{baseUrl}}"], "path": ["actions", "deliverability", "surbl-check"] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"ottitcfo.info\"\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Notifications",
+      "description": "Source: `notifications` table (Supabase, Realtime enabled). Written by:\n- `notifier` worker (every 15min) — bounce spikes, daily limit alerts, high spam scores\n- Webhook handler — lead replies, interested leads, account disconnect/reconnect events",
+      "item": [
+        {
+          "name": "List notifications",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/notifications",
+              "host": ["{{baseUrl}}"],
+              "path": ["notifications"],
+              "query": [
+                { "key": "unread",       "value": "true",     "description": "Only unread notifications",                  "disabled": true },
+                { "key": "resolved",     "value": "false",    "description": "Exclude resolved",                           "disabled": true },
+                { "key": "severity",     "value": "critical", "description": "critical | warning | info | resolved",       "disabled": true },
+                { "key": "entity_type",  "value": "sender",   "description": "sender | lead | domain | campaign",          "disabled": true },
+                { "key": "limit",        "value": "100",      "description": "Max results (default: 100)" }
+              ]
+            },
+            "description": "Severity levels: `critical`, `warning`, `info`, `resolved`.\nNotification types: `bounce_spike`, `daily_limit_approaching`, `spam_score_high`, `lead_replied`, `lead_interested`, `account_disconnected`, `account_reconnected`."
+          }
+        },
+        {
+          "name": "Mark notification read",
+          "request": {
+            "method": "PATCH",
+            "url": { "raw": "{{baseUrl}}/notifications/1/read", "host": ["{{baseUrl}}"], "path": ["notifications", "1", "read"] },
+            "description": "Sets `read = true` for the given notification ID."
+          }
+        },
+        {
+          "name": "Resolve notification",
+          "request": {
+            "method": "PATCH",
+            "url": { "raw": "{{baseUrl}}/notifications/1/resolve", "host": ["{{baseUrl}}"], "path": ["notifications", "1", "resolve"] },
+            "description": "Sets `resolved = true` and `read = true`. Use for critical/warning alerts that have been addressed."
+          }
+        },
+        {
+          "name": "Mark all as read",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/notifications/read-all", "host": ["{{baseUrl}}"], "path": ["notifications", "read-all"] },
+            "description": "Bulk marks all unread notifications as read."
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Campaign Actions",
+      "description": "Write operations proxied to EmailBison. All logged to `dashboard_action_log`. Pass `X-User-Email` header to record who performed the action.",
+      "item": [
+        {
+          "name": "Pause campaign",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/campaigns/394/pause", "host": ["{{baseUrl}}"], "path": ["actions", "campaigns", "394", "pause"] },
+            "header": [{ "key": "X-User-Email", "value": "user@ottit.com", "description": "Who is performing the action" }]
+          }
+        },
+        {
+          "name": "Resume campaign",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/campaigns/394/resume", "host": ["{{baseUrl}}"], "path": ["actions", "campaigns", "394", "resume"] },
+            "header": [{ "key": "X-User-Email", "value": "user@ottit.com" }]
+          }
+        },
+        {
+          "name": "Archive campaign",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/campaigns/394/archive", "host": ["{{baseUrl}}"], "path": ["actions", "campaigns", "394", "archive"] },
+            "header": [{ "key": "X-User-Email", "value": "user@ottit.com" }]
+          }
+        },
+        {
+          "name": "Duplicate campaign",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/campaigns/394/duplicate", "host": ["{{baseUrl}}"], "path": ["actions", "campaigns", "394", "duplicate"] },
+            "header": [{ "key": "X-User-Email", "value": "user@ottit.com" }]
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Sender Actions",
+      "item": [
+        {
+          "name": "Update daily limit",
+          "request": {
+            "method": "PATCH",
+            "url": { "raw": "{{baseUrl}}/actions/senders/7953/daily-limit", "host": ["{{baseUrl}}"], "path": ["actions", "senders", "7953", "daily-limit"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-Email", "value": "user@ottit.com" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"daily_limit\": 50\n}" },
+            "description": "Updates the sender's daily send limit in EmailBison. Logged to `dashboard_action_log`."
+          }
+        },
+        {
+          "name": "Toggle warmup",
+          "request": {
+            "method": "PATCH",
+            "url": { "raw": "{{baseUrl}}/actions/senders/7953/warmup", "host": ["{{baseUrl}}"], "path": ["actions", "senders", "7953", "warmup"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-Email", "value": "user@ottit.com" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"enable\": true\n}" },
+            "description": "Enable or disable warmup for a sender. Set `enable: false` to disable."
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Reply Actions",
+      "item": [
+        {
+          "name": "Mark reply interested",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/replies/123/mark-interested", "host": ["{{baseUrl}}"], "path": ["actions", "replies", "123", "mark-interested"] },
+            "header": [{ "key": "X-User-Email", "value": "user@ottit.com" }]
+          }
+        },
+        {
+          "name": "Mark reply not interested",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/replies/123/mark-not-interested", "host": ["{{baseUrl}}"], "path": ["actions", "replies", "123", "mark-not-interested"] },
+            "header": [{ "key": "X-User-Email", "value": "user@ottit.com" }]
+          }
+        },
+        {
+          "name": "Send reply",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/actions/replies/send", "host": ["{{baseUrl}}"], "path": ["actions", "replies", "send"] },
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-Email", "value": "user@ottit.com" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"lead@example.com\",\n  \"subject\": \"Following up\",\n  \"body\": \"Hi, just following up on my previous email.\",\n  \"campaign_id\": \"394\"\n}"
+            }
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Webhook",
+      "description": "Receives events from EmailBison. Signature verified via HMAC-SHA256 if `WEBHOOK_SECRET` is set. Idempotent — duplicate events for the same entity on the same day are silently skipped.",
+      "item": [
+        {
+          "name": "Receive webhook event",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "url": { "raw": "{{baseUrl}}/webhook", "host": ["{{baseUrl}}"], "path": ["webhook"] },
+            "header": [
+              { "key": "Content-Type",       "value": "application/json" },
+              { "key": "X-Webhook-Signature","value": "<hmac-sha256-hex>", "description": "Optional. Required if WEBHOOK_SECRET is set." }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"event\": \"lead_replied\",\n  \"lead_id\": 12345\n}"
+            },
+            "description": "Supported event types:\n- `email_sent` — no-op, stats updated on next poller run\n- `lead_replied` → creates `info` notification\n- `lead_interested` → creates `info` notification\n- `email_bounced` → logged only\n- `email_account_disconnected` → creates `critical` notification + Slack alert\n- `email_account_reconnected` → creates `resolved` notification"
+          }
+        }
+      ]
+    }
+
+  ]
+}
