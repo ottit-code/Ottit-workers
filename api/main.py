@@ -6,6 +6,27 @@ Write/action endpoints proxy to EmailBison/EmailGuard and log to dashboard_actio
 
 Architecture:
   Frontend → this API → Supabase (reads) / EmailBison+EmailGuard (writes)
+
+Read endpoint summary
+─────────────────────
+  GET /health
+  GET /stats                        workspace daily stats
+  GET /senders                      sender daily stats
+  GET /senders/{id}/history
+  GET /campaigns                    live from EmailBison
+  GET /leads                        live from EmailBison
+  GET /replies                      live from EmailBison
+  GET /campaign-stats               campaign_daily_stats (polled)
+  GET /campaign-stats/{id}/history
+  GET /ab-tests                     ab_test_snapshots (polled)
+  GET /ab-tests/{campaign_id}
+  GET /reply-events                 reply_events (polled)
+  GET /lead-engagement              lead_engagement_snapshots (polled)
+  GET /lead-engagement/{lead_id}
+  GET /sender-performance           sender_email_performance (polled)
+  GET /sender-performance/{id}
+  GET /deliverability/*
+  GET /notifications
 """
 
 import hashlib
@@ -517,6 +538,309 @@ def handle_account_reconnected(payload: dict) -> None:
         body="Email account reconnected successfully.",
         entity_type="sender", entity_id=entity_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Campaign daily stats — from Supabase (written by campaign_daily_stats_poller)
+# ---------------------------------------------------------------------------
+
+_CAMPAIGN_STATS_COLS = (
+    "campaign_id,campaign_name,campaign_status,stat_date,"
+    "emails_sent,emails_opened,unique_opens,emails_replied,emails_bounced,"
+    "unsubscribed,interested,open_rate,reply_rate,bounce_rate,"
+    "max_emails_per_day,max_new_leads_per_day,total_leads_contacted,"
+    "completion_percentage,fetched_at"
+)
+
+
+@app.get("/campaign-stats", dependencies=[Security(require_api_key)])
+def list_campaign_stats(
+    campaign_id: Optional[str] = None,
+    days: int = 30,
+    status: Optional[str] = None,
+):
+    """
+    Per-campaign daily stats from campaign_daily_stats (polled daily at midnight).
+    Returns rows for the last N days. Filter by campaign_id or status.
+    """
+    supabase = get_supabase()
+    since = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    try:
+        query = (
+            supabase.table("campaign_daily_stats")
+            .select(_CAMPAIGN_STATS_COLS)
+            .gte("stat_date", since)
+            .order("stat_date", desc=True)
+        )
+        if campaign_id:
+            query = query.eq("campaign_id", campaign_id)
+        if status:
+            query = query.eq("campaign_status", status)
+        return query.execute().data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/campaign-stats/{campaign_id}/history", dependencies=[Security(require_api_key)])
+def campaign_stats_history(campaign_id: str, days: int = 90):
+    """Full date-series for a single campaign."""
+    supabase = get_supabase()
+    since = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    try:
+        result = (
+            supabase.table("campaign_daily_stats")
+            .select(_CAMPAIGN_STATS_COLS)
+            .eq("campaign_id", campaign_id)
+            .gte("stat_date", since)
+            .order("stat_date")
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="No stats found for this campaign")
+        return result.data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# A/B test snapshots — from Supabase (written by ab_test_snapshots_poller)
+# ---------------------------------------------------------------------------
+
+_AB_TEST_COLS = (
+    "campaign_id,sequence_step_id,snapshot_date,email_subject,step_order,"
+    "is_variant,variant_from_step_id,thread_reply,"
+    "emails_sent,opens,unique_opens,clicks,replies,unique_replies,interested,bounced,"
+    "open_rate,reply_rate,click_rate,interest_rate,bounce_rate,"
+    "stat_confidence,stat_winner,stat_sample_sufficient,fetched_at"
+)
+
+
+@app.get("/ab-tests", dependencies=[Security(require_api_key)])
+def list_ab_tests(
+    campaign_id: Optional[str] = None,
+    snapshot_date: Optional[str] = None,
+    variants_only: Optional[bool] = None,
+):
+    """
+    A/B test snapshots from ab_test_snapshots (polled every 6 hours).
+    Defaults to today's snapshot. Use snapshot_date=YYYY-MM-DD for a specific date.
+    Set variants_only=true to return only variant steps.
+    """
+    supabase = get_supabase()
+    date = snapshot_date or _today()
+    try:
+        query = (
+            supabase.table("ab_test_snapshots")
+            .select(_AB_TEST_COLS)
+            .eq("snapshot_date", date)
+            .order("campaign_id")
+            .order("step_order")
+        )
+        if campaign_id:
+            query = query.eq("campaign_id", campaign_id)
+        if variants_only is not None:
+            query = query.eq("is_variant", variants_only)
+        return query.execute().data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ab-tests/{campaign_id}", dependencies=[Security(require_api_key)])
+def get_ab_test_for_campaign(campaign_id: str, snapshot_date: Optional[str] = None):
+    """All sequence steps + A/B stats for a specific campaign (today by default)."""
+    supabase = get_supabase()
+    date = snapshot_date or _today()
+    try:
+        result = (
+            supabase.table("ab_test_snapshots")
+            .select(_AB_TEST_COLS)
+            .eq("campaign_id", campaign_id)
+            .eq("snapshot_date", date)
+            .order("step_order")
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="No snapshot found for this campaign")
+        return result.data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Reply events — from Supabase (written by reply_events_poller)
+# ---------------------------------------------------------------------------
+
+_REPLY_EVENT_COLS = (
+    "reply_id,campaign_id,campaign_name,lead_id,lead_email,"
+    "sender_email_id,sender_email,sequence_step_id,classification,"
+    "folder,replied_at,original_sent_at,response_time_hours,"
+    "subject,has_attachment,is_thread_reply,fetched_at"
+)
+
+
+@app.get("/reply-events", dependencies=[Security(require_api_key)])
+def list_reply_events(
+    campaign_id: Optional[str] = None,
+    classification: Optional[str] = None,
+    lead_email: Optional[str] = None,
+    days: int = 30,
+    limit: int = 200,
+):
+    """
+    Reply events from reply_events (polled every 4 hours).
+    Filter by campaign_id, classification (interested/not_automated_reply/automated_reply),
+    or lead_email. Returns most recent N days.
+    """
+    supabase = get_supabase()
+    since = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    try:
+        query = (
+            supabase.table("reply_events")
+            .select(_REPLY_EVENT_COLS)
+            .gte("replied_at", since)
+            .order("replied_at", desc=True)
+            .limit(limit)
+        )
+        if campaign_id:
+            query = query.eq("campaign_id", campaign_id)
+        if classification:
+            query = query.eq("classification", classification)
+        if lead_email:
+            query = query.eq("lead_email", lead_email)
+        return query.execute().data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Lead engagement snapshots — from Supabase (written by lead_engagement_poller)
+# ---------------------------------------------------------------------------
+
+_LEAD_ENGAGEMENT_COLS = (
+    "lead_id,snapshot_date,first_name,last_name,email,title,company,"
+    "lead_status,tags,emails_sent,opens,unique_opens,replies,unique_replies,"
+    "engagement_score,funnel_stage,campaign_engagements,custom_variables,fetched_at"
+)
+
+
+@app.get("/lead-engagement", dependencies=[Security(require_api_key)])
+def list_lead_engagement(
+    funnel_stage: Optional[str] = None,
+    snapshot_date: Optional[str] = None,
+    limit: int = 100,
+):
+    """
+    Lead engagement snapshots from lead_engagement_snapshots (polled daily at 2 AM).
+    Defaults to today's snapshot. Filter by funnel_stage:
+    uploaded / contacted / opened / replied / interested.
+    """
+    supabase = get_supabase()
+    date = snapshot_date or _today()
+    try:
+        query = (
+            supabase.table("lead_engagement_snapshots")
+            .select(_LEAD_ENGAGEMENT_COLS)
+            .eq("snapshot_date", date)
+            .order("engagement_score", desc=True)
+            .limit(limit)
+        )
+        if funnel_stage:
+            query = query.eq("funnel_stage", funnel_stage)
+        return query.execute().data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/lead-engagement/{lead_id}", dependencies=[Security(require_api_key)])
+def get_lead_engagement(lead_id: str, days: int = 30):
+    """Historical engagement snapshots for a specific lead."""
+    supabase = get_supabase()
+    since = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    try:
+        result = (
+            supabase.table("lead_engagement_snapshots")
+            .select(_LEAD_ENGAGEMENT_COLS)
+            .eq("lead_id", lead_id)
+            .gte("snapshot_date", since)
+            .order("snapshot_date", desc=True)
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="No engagement data for this lead")
+        return result.data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Sender email performance — from Supabase (written by sender_performance_poller)
+# ---------------------------------------------------------------------------
+
+_SENDER_PERF_COLS = (
+    "sender_email_id,snapshot_date,email,domain,connection_type,connection_status,"
+    "warmup_enabled,emails_sent,total_leads_contacted,unique_replied_count,"
+    "unique_opened_count,bounced_count,interested_leads_count,"
+    "reply_rate,open_rate,bounce_rate,interest_rate,"
+    "warmup_score,in_recovery,recovery_policy_key,recovery_strike_count,"
+    "placement_score,spam_score,health_score,tags,fetched_at"
+)
+
+
+@app.get("/sender-performance", dependencies=[Security(require_api_key)])
+def list_sender_performance(
+    domain: Optional[str] = None,
+    in_recovery: Optional[bool] = None,
+    snapshot_date: Optional[str] = None,
+):
+    """
+    Sender performance snapshots from sender_email_performance (polled daily at 1 AM).
+    Defaults to today's snapshot. Filter by domain or in_recovery status.
+    """
+    supabase = get_supabase()
+    date = snapshot_date or _today()
+    try:
+        query = (
+            supabase.table("sender_email_performance")
+            .select(_SENDER_PERF_COLS)
+            .eq("snapshot_date", date)
+            .order("health_score", desc=True)
+        )
+        if domain:
+            query = query.eq("domain", domain)
+        if in_recovery is not None:
+            query = query.eq("in_recovery", in_recovery)
+        return query.execute().data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sender-performance/{sender_email_id}", dependencies=[Security(require_api_key)])
+def get_sender_performance_history(sender_email_id: int, days: int = 30):
+    """Time-series performance snapshots for a single sender."""
+    supabase = get_supabase()
+    since = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    try:
+        result = (
+            supabase.table("sender_email_performance")
+            .select(_SENDER_PERF_COLS)
+            .eq("sender_email_id", sender_email_id)
+            .gte("snapshot_date", since)
+            .order("snapshot_date", desc=True)
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="No performance data for this sender")
+        return result.data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
