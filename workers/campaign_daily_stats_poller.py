@@ -121,15 +121,6 @@ def poll_campaign_daily_stats() -> None:
                 logger.warning(f"No chart stats returned for campaign {campaign_id}")
                 continue
 
-            # Campaign summary stats (total contacts, completion %)
-            summary: dict = {}
-            try:
-                raw_summary = emailbison.get_campaign_stats(campaign_id)
-                if isinstance(raw_summary, dict):
-                    summary = raw_summary.get("data", raw_summary)
-            except Exception as e:
-                logger.warning(f"Could not fetch summary stats for campaign {campaign_id}: {e}")
-
             fetched_at = datetime.now(timezone.utc).isoformat()
             for date_str, metrics in by_date.items():
                 sent = metrics.get("emails_sent", 0)
@@ -157,8 +148,6 @@ def poll_campaign_daily_stats() -> None:
                     "plain_text": details.get("plain_text"),
                     "open_tracking": details.get("open_tracking"),
                     "sequence_prioritization": details.get("sequence_prioritization"),
-                    "total_leads_contacted": summary.get("total_leads_contacted"),
-                    "completion_percentage": summary.get("completion_percentage"),
                     "fetched_at": fetched_at,
                 })
         except httpx.HTTPStatusError as e:
