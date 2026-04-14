@@ -9,6 +9,8 @@ deliverability and recovery data from Supabase, and upserts into:
 import logging
 from datetime import datetime, timezone
 
+import httpx
+
 from lib import emailbison
 from lib.supabase_client import get_supabase
 from lib.utils import get_active_campaign_ids
@@ -160,6 +162,11 @@ def poll_sender_email_performance() -> None:
                 sid = int(sid)
                 if sid not in senders_by_id:
                     senders_by_id[sid] = account
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Campaign {campaign_id} not found (404) — may have been deleted from EmailBison")
+            else:
+                logger.error(f"Failed to fetch email accounts for campaign {campaign_id}: {e}")
         except Exception as e:
             logger.error(f"Failed to fetch email accounts for campaign {campaign_id}: {e}")
 

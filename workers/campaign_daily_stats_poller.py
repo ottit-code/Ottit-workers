@@ -12,6 +12,8 @@ Backfill strategy:
 import logging
 from datetime import datetime, timedelta, timezone
 
+import httpx
+
 from lib import emailbison
 from lib.supabase_client import get_supabase
 from lib.utils import get_active_campaign_ids
@@ -159,6 +161,11 @@ def poll_campaign_daily_stats() -> None:
                     "completion_percentage": summary.get("completion_percentage"),
                     "fetched_at": fetched_at,
                 })
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Campaign {campaign_id} not found (404) — may have been deleted from EmailBison")
+            else:
+                logger.error(f"Failed to process daily stats for campaign {campaign_id}: {e}")
         except Exception as e:
             logger.error(f"Failed to process daily stats for campaign {campaign_id}: {e}")
 

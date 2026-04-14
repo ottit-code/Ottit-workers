@@ -9,6 +9,8 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 
+import httpx
+
 from lib import emailbison
 from lib.supabase_client import get_supabase
 from lib.utils import get_active_campaign_ids
@@ -68,10 +70,10 @@ def _compute_significance(supabase, parent_a: dict, variant_a: dict) -> tuple:
     """Call compute_ab_significance RPC. Returns (confidence, winner, sample_sufficient)."""
     try:
         result = supabase.rpc("compute_ab_significance", {
-            "control_replies": parent_a.get("unique_replies", 0),
-            "control_sent": parent_a.get("emails_sent", 0),
-            "variant_replies": variant_a.get("unique_replies", 0),
-            "variant_sent": variant_a.get("emails_sent", 0),
+            "conversions_a": parent_a.get("unique_replies", 0),
+            "samples_a": parent_a.get("emails_sent", 0),
+            "conversions_b": variant_a.get("unique_replies", 0),
+            "samples_b": variant_a.get("emails_sent", 0),
             "min_sample": 30,
         }).execute()
         if result.data:
@@ -146,6 +148,11 @@ def poll_ab_test_snapshots() -> None:
                     "stat_sample_sufficient": stat_sample_sufficient,
                     "fetched_at": fetched_at,
                 })
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Campaign {campaign_id} not found (404) — may have been deleted from EmailBison")
+            else:
+                logger.error(f"Failed to process A/B snapshots for campaign {campaign_id}: {e}")
         except Exception as e:
             logger.error(f"Failed to process A/B snapshots for campaign {campaign_id}: {e}")
 

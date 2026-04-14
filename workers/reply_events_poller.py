@@ -11,6 +11,8 @@ Uses ON CONFLICT (reply_id) so already-ingested replies are idempotent.
 import logging
 from datetime import datetime, timezone
 
+import httpx
+
 from lib import emailbison
 from lib.supabase_client import get_supabase
 from lib.utils import get_active_campaign_ids
@@ -88,6 +90,12 @@ def poll_reply_events() -> None:
                         "is_thread_reply": bool(reply.get("thread_reply", False)),
                         "fetched_at": datetime.now(timezone.utc).isoformat(),
                     })
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    logger.warning(f"Campaign {campaign_id} not found (404) — may have been deleted from EmailBison")
+                    break  # No point trying other classifications for this campaign
+                else:
+                    logger.error(f"Failed to fetch {classification} replies for campaign {campaign_id}: {e}")
             except Exception as e:
                 logger.error(
                     f"Failed to fetch {classification} replies "

@@ -101,10 +101,10 @@ class TestPollSenderEmailPerformance:
         assert len(rows) == 1  # Deduplicated across 2 campaigns
         row = rows[0]
         assert row["sender_email_id"] == 1
-        assert row["email"] == "s@example.com"
+        assert row["sender_email"] == "s@example.com"
         assert row["connection_type"] == "gmail"
         assert row["connection_status"] == "connected"
-        assert row["emails_sent"] == 1000
+        assert row["emails_sent_count"] == 1000
 
     def test_computes_rates_correctly(self):
         sb = self._make_supabase()

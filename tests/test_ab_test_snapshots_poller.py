@@ -175,10 +175,10 @@ class TestPollAbTestSnapshots:
             poll_ab_test_snapshots()
 
         sb.rpc.assert_called_once_with("compute_ab_significance", {
-            "control_replies": 5,
-            "control_sent": 1,
-            "variant_replies": 3,
-            "variant_sent": 1,
+            "conversions_a": 5,
+            "samples_a": 1,
+            "conversions_b": 3,
+            "samples_b": 1,
             "min_sample": 30,
         })
 
