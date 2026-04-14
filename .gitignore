@@ -8,3 +8,8 @@ build/
 venv/
 *.log
 .DS_Store
+
+# API documentation / Postman collections (local reference only)
+api-documentation.json
+emailguard-postman-collection.json
+ottit-api.postman_collection.json

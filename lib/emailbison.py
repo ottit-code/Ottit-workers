@@ -61,7 +61,17 @@ def get_workspace_chart_stats(start_date: str, end_date: str) -> dict:
     return get("/api/workspaces/v1.1/line-area-chart-stats", params={"start_date": start_date, "end_date": end_date})
 
 def get_campaign_sequence_steps(campaign_id: str) -> list:
-    return _extract_list(get(f"/api/campaigns/v1.1/{campaign_id}/sequence-steps"))
+    # Response: {"data": {"sequence_id": int, "sequence_steps": [...]}}
+    data = get(f"/api/campaigns/v1.1/{campaign_id}/sequence-steps")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        inner = data.get("data", data)
+        if isinstance(inner, list):
+            return inner
+        if isinstance(inner, dict):
+            return inner.get("sequence_steps", [])
+    return []
 
 def get_campaign_scheduled_emails(campaign_id: str) -> list:
     return _extract_list(get(f"/api/campaigns/{campaign_id}/scheduled-emails"))
@@ -74,7 +84,7 @@ def get_campaign_stats(campaign_id: str) -> dict:
     return post(f"/api/campaigns/{campaign_id}/stats")
 
 def get_campaign_details(campaign_id: str) -> dict:
-    res = get(f"/api/campaigns/v1.1/{campaign_id}")
+    res = get(f"/api/campaigns/{campaign_id}")
     if isinstance(res, dict):
         return res.get("data", res) if "data" in res else res
     return {}
@@ -87,4 +97,4 @@ def get_campaign_replies(campaign_id: str, status: str) -> list:
     return _extract_list(get(f"/api/campaigns/{campaign_id}/replies", params={"status": status}))
 
 def get_campaign_email_accounts(campaign_id: str) -> list:
-    return _extract_list(get(f"/api/campaigns/{campaign_id}/email-accounts"))
+    return _extract_list(get(f"/api/campaigns/{campaign_id}/sender-emails"))

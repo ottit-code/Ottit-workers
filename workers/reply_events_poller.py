@@ -62,15 +62,20 @@ def poll_reply_events() -> None:
                     sent_at = scheduled.get("sent_at")
                     replied_at = reply.get("replied_at")
 
+                    # Integer fields: fall back to top-level reply fields, never use ""
+                    lead_id = lead.get("id") or reply.get("lead_id") or None
+                    sender_email_id = sender.get("id") or reply.get("sender_email_id") or None
+                    seq_step_id = scheduled.get("sequence_step_id") or None
+
                     all_rows.append({
                         "reply_id": reply_id,
-                        "campaign_id": str(campaign.get("id") or campaign_id),
+                        "campaign_id": str(campaign.get("id") or reply.get("campaign_id") or campaign_id),
                         "campaign_name": campaign.get("name"),
-                        "lead_id": str(lead.get("id") or ""),
-                        "lead_email": lead.get("email"),
-                        "sender_email_id": str(sender.get("id") or ""),
+                        "lead_id": lead_id,
+                        "lead_email": lead.get("email") or reply.get("from_email_address"),
+                        "sender_email_id": sender_email_id,
                         "sender_email": sender.get("email"),
-                        "sequence_step_id": scheduled.get("sequence_step_id"),
+                        "sequence_step_id": seq_step_id,
                         "classification": classification,
                         "folder": reply.get("folder"),
                         "replied_at": replied_at,
