@@ -14,6 +14,13 @@ from lib.supabase_client import get_supabase
 logger = logging.getLogger(__name__)
 
 
+def _domain_from_email(email: str) -> str:
+    """Extract domain from an email address, e.g. 'user@example.com' → 'example.com'."""
+    if email and "@" in email:
+        return email.split("@", 1)[1].lower()
+    return ""
+
+
 def poll_placement_tests() -> None:
     """Batch-upsert inbox placement tests; for completed tests, batch-write per-email child rows."""
     supabase = get_supabase()
@@ -27,7 +34,7 @@ def poll_placement_tests() -> None:
             continue
         parent_rows.append({
             "eg_test_uuid": str(uuid),
-            "domain": test.get("domain") or "",
+            "domain": test.get("domain") or _domain_from_email(test.get("sender_email") or ""),
             "sender_email_id": int(test.get("sender_email_id", 0)),
             "sender_email": test.get("sender_email") or "",
             "triggered_by": "delivery_poller",
@@ -37,6 +44,27 @@ def poll_placement_tests() -> None:
             "overall_score": test.get("overall_score"),
             "passed": test.get("passed"),
         })
+
+    # For rows still missing domain/sender_email, look up from sender_daily_stats
+    missing_ids = [r["sender_email_id"] for r in parent_rows if not r["domain"] and r["sender_email_id"]]
+    if missing_ids:
+        try:
+            sender_rows = (
+                supabase.table("sender_daily_stats")
+                .select("sender_email_id,sender_email,domain")
+                .in_("sender_email_id", list(set(missing_ids)))
+                .execute()
+                .data
+            )
+            sender_map = {
+                s["sender_email_id"]: (s.get("domain") or _domain_from_email(s.get("sender_email") or ""), s.get("sender_email") or "")
+                for s in sender_rows
+            }
+            for row in parent_rows:
+                if not row["domain"] and row["sender_email_id"] in sender_map:
+                    row["domain"], row["sender_email"] = sender_map[row["sender_email_id"]]
+        except Exception as e:
+            logger.warning(f"Could not look up sender domains: {e}")
 
     if not parent_rows:
         return

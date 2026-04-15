@@ -549,7 +549,7 @@ _CAMPAIGN_STATS_COLS = (
     "emails_sent,emails_opened,unique_opens,emails_replied,emails_bounced,"
     "unsubscribed,interested,open_rate,reply_rate,bounce_rate,"
     "max_emails_per_day,max_new_leads_per_day,total_leads_contacted,"
-    "completion_percentage,fetched_at"
+    "completion_pct,fetched_at"
 )
 
 
@@ -722,7 +722,7 @@ def list_reply_events(
 
 _LEAD_ENGAGEMENT_COLS = (
     "lead_id,snapshot_date,first_name,last_name,email,title,company,"
-    "lead_status,tags,emails_sent,opens,unique_opens,replies,unique_replies,"
+    "status,tags,emails_sent,opens,unique_opens,replies,unique_replies,"
     "engagement_score,funnel_stage,campaign_engagements,custom_variables,fetched_at"
 )
 
@@ -783,12 +783,12 @@ def get_lead_engagement(lead_id: str, days: int = 30):
 # ---------------------------------------------------------------------------
 
 _SENDER_PERF_COLS = (
-    "sender_email_id,snapshot_date,email,domain,connection_type,connection_status,"
-    "warmup_enabled,emails_sent,total_leads_contacted,unique_replied_count,"
+    "sender_email_id,snapshot_date,sender_email,domain,connection_type,connection_status,"
+    "warmup_enabled,emails_sent_count,total_leads_contacted_count,unique_replied_count,"
     "unique_opened_count,bounced_count,interested_leads_count,"
     "reply_rate,open_rate,bounce_rate,interest_rate,"
     "warmup_score,in_recovery,recovery_policy_key,recovery_strike_count,"
-    "placement_score,spam_score,health_score,tags,fetched_at"
+    "latest_placement_score,latest_spam_score,health_score,tags,fetched_at"
 )
 
 
