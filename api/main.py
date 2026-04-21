@@ -462,7 +462,13 @@ async def receive_webhook(request: Request):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    event_type = payload.get("event") or payload.get("type", "unknown")
+    # EmailGuard sends event as a nested dict: {"event": {"type": "DOMAIN_BLACKLIST_CHECK_PERFORMED", ...}}
+    # EmailBison sends it as a flat string: {"event": "email_sent", ...}
+    raw_event = payload.get("event") or payload.get("type", "unknown")
+    if isinstance(raw_event, dict):
+        event_type = raw_event.get("type", "unknown")
+    else:
+        event_type = raw_event
     logger.info(f"Received webhook event: {event_type}")
 
     handlers = {
@@ -472,6 +478,7 @@ async def receive_webhook(request: Request):
         "email_bounced": handle_email_bounced,
         "email_account_disconnected": handle_account_disconnected,
         "email_account_reconnected": handle_account_reconnected,
+        "DOMAIN_BLACKLIST_CHECK_PERFORMED": handle_domain_blacklist_check,
     }
 
     handler = handlers.get(event_type)
@@ -538,6 +545,48 @@ def handle_account_reconnected(payload: dict) -> None:
         body="Email account reconnected successfully.",
         entity_type="sender", entity_id=entity_id,
     )
+
+
+def handle_domain_blacklist_check(payload: dict) -> None:
+    check = (payload.get("data") or {}).get("blacklist_check") or {}
+    eg_uuid = check.get("uuid", "")
+    domain = check.get("domain", "")
+    blacklists_count = int(check.get("blacklists_count") or 0)
+
+    if not eg_uuid or not domain:
+        logger.warning(f"DOMAIN_BLACKLIST_CHECK_PERFORMED missing uuid/domain: {payload}")
+        return
+
+    # Upsert into domain_blacklist_checks so the table stays current in real time
+    try:
+        get_supabase().table("domain_blacklist_checks").upsert(
+            {
+                "eg_check_uuid": eg_uuid,
+                "domain": domain,
+                "ip": check.get("ip"),
+                "type": check.get("type"),
+                "status": check.get("status"),
+                "blacklists_count": blacklists_count,
+                "blacklists": check.get("blacklists") or [],
+                "last_polled_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="eg_check_uuid",
+        ).execute()
+        logger.info(f"Upserted domain blacklist check via webhook: {domain} ({blacklists_count} blacklists)")
+    except Exception as e:
+        logger.error(f"Failed to upsert domain blacklist check from webhook: {e}")
+
+    # Fire a critical notification only if newly blacklisted
+    if blacklists_count > 0 and not _notification_exists("domain_blacklisted", eg_uuid):
+        blacklists = check.get("blacklists") or []
+        create_notification(
+            severity="critical",
+            type_="domain_blacklisted",
+            title=f"Domain blacklisted: {domain}",
+            body=f"Found on {blacklists_count} blacklist(s): {', '.join(blacklists)}.",
+            entity_type="domain",
+            entity_id=eg_uuid,
+        )
 
 
 # ---------------------------------------------------------------------------

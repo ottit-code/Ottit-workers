@@ -48,3 +48,16 @@ def get_spam_filter_tests() -> list:
 
 def get_surbl_checks() -> list:
     return _extract_list(get("/api/v1/surbl-blacklist-checks/domains"))
+
+def get_domain_blacklist_checks() -> list:
+    """Fetch all pages from /api/v1/blacklist-checks/domains and return combined list."""
+    results = []
+    page = 1
+    while True:
+        resp = get("/api/v1/blacklist-checks/domains", params={"page": page})
+        results.extend(resp.get("data", []))
+        meta = resp.get("meta", {})
+        if page >= meta.get("last_page", 1):
+            break
+        page += 1
+    return results

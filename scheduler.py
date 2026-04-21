@@ -10,6 +10,7 @@ Runs all pollers on their schedules:
 - campaign_daily_stats_poller:   daily at midnight
 - sender_performance_poller:     daily at 1 AM
 - lead_engagement_poller:        daily at 2 AM
+- domain_blacklist_poller:       every 12 hours
 
 NOTE: The action API server must be run separately:
   uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -27,6 +28,7 @@ from workers import (
     lead_engagement_poller,
     reply_events_poller,
     sender_performance_poller,
+    domain_blacklist_poller,
 )
 
 logging.basicConfig(
@@ -48,6 +50,7 @@ def main():
     campaign_daily_stats_poller.run()
     reply_events_poller.run()
     sender_performance_poller.run()
+    domain_blacklist_poller.run()
     # lead_engagement_poller is intentionally skipped on startup — 48 k leads
     # is expensive; let the scheduled 2 AM run handle it.
 
@@ -71,6 +74,8 @@ def main():
                       id="sender_performance_poller", max_instances=1, coalesce=True)
     scheduler.add_job(lead_engagement_poller.run, "cron", hour=2, minute=0,
                       id="lead_engagement_poller", max_instances=1, coalesce=True)
+    scheduler.add_job(domain_blacklist_poller.run, "interval", hours=12,
+                      id="domain_blacklist_poller", max_instances=1, coalesce=True)
 
     logger.info("Scheduler started")
     try:
