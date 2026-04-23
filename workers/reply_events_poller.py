@@ -61,13 +61,24 @@ def poll_reply_events() -> None:
                     sender = reply.get("sender_email") or {}
                     campaign = reply.get("campaign") or {}
                     scheduled = reply.get("scheduled_email") or {}
-                    sent_at = scheduled.get("sent_at")
-                    replied_at = reply.get("replied_at")
 
-                    # Integer fields: fall back to top-level reply fields, never use ""
+                    # EmailBison returns `date_received` on /api/campaigns/{id}/replies;
+                    # `replied_at` is only present on the legacy /api/replies list.
+                    replied_at = (
+                        scheduled.get("replied_at")
+                        or reply.get("replied_at")
+                        or reply.get("date_received")
+                        or reply.get("created_at")
+                    )
+                    sent_at = scheduled.get("sent_at")
+
                     lead_id = lead.get("id") or reply.get("lead_id") or None
                     sender_email_id = sender.get("id") or reply.get("sender_email_id") or None
-                    seq_step_id = scheduled.get("sequence_step_id") or None
+                    seq_step_id = (
+                        scheduled.get("sequence_step_id")
+                        or reply.get("sequence_step_id")
+                        or None
+                    )
 
                     all_rows.append({
                         "reply_id": reply_id,
@@ -76,7 +87,7 @@ def poll_reply_events() -> None:
                         "lead_id": lead_id,
                         "lead_email": lead.get("email") or reply.get("from_email_address"),
                         "sender_email_id": sender_email_id,
-                        "sender_email": sender.get("email"),
+                        "sender_email": sender.get("email") or reply.get("primary_to_email_address"),
                         "sequence_step_id": seq_step_id,
                         "classification": classification,
                         "folder": reply.get("folder"),
@@ -86,8 +97,8 @@ def poll_reply_events() -> None:
                             replied_at, sent_at
                         ),
                         "subject": reply.get("subject"),
-                        "has_attachment": bool(reply.get("has_attachments", False)),
-                        "is_thread_reply": bool(reply.get("thread_reply", False)),
+                        "has_attachment": bool(reply.get("attachments") or reply.get("has_attachments")),
+                        "is_thread_reply": bool(reply.get("parent_id") or reply.get("thread_reply")),
                         "fetched_at": datetime.now(timezone.utc).isoformat(),
                     })
             except httpx.HTTPStatusError as e:

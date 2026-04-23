@@ -41,6 +41,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 
@@ -104,25 +105,41 @@ def _today() -> str:
 # Health
 # ---------------------------------------------------------------------------
 
-@app.get("/health")
-def health():
-    checks = {}
+def _probe_supabase() -> str:
     try:
         get_supabase().table("notifications").select("id").limit(1).execute()
-        checks["supabase"] = "ok"
+        return "ok"
     except Exception as e:
-        checks["supabase"] = f"error: {e}"
-    try:
-        emailbison.get("/api/sender-emails")
-        checks["emailbison"] = "ok"
-    except Exception as e:
-        checks["emailbison"] = f"error: {e}"
-    try:
-        emailguard.get("/api/v1/inbox-placement-tests")
-        checks["emailguard"] = "ok"
-    except Exception as e:
-        checks["emailguard"] = f"error: {e}"
+        return f"error: {e}"
 
+
+def _probe_emailbison() -> str:
+    try:
+        emailbison.get("/api/sender-emails", params={"per_page": 1})
+        return "ok"
+    except Exception as e:
+        return f"error: {e}"
+
+
+def _probe_emailguard() -> str:
+    try:
+        emailguard.get("/api/v1/inbox-placement-tests", params={"per_page": 1})
+        return "ok"
+    except Exception as e:
+        return f"error: {e}"
+
+
+@app.get("/health")
+def health():
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        sb_f = pool.submit(_probe_supabase)
+        eb_f = pool.submit(_probe_emailbison)
+        eg_f = pool.submit(_probe_emailguard)
+        checks = {
+            "supabase": sb_f.result(),
+            "emailbison": eb_f.result(),
+            "emailguard": eg_f.result(),
+        }
     overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
     return {"status": overall, **checks}
 
@@ -1045,30 +1062,52 @@ def _today_volume_map(sender_ids: list[int]) -> dict[int, int]:
         return {}
 
 
-def _warm_state_since(sender_email_id: int, current_state: str) -> Optional[str]:
+def _warm_state_since_map(sender_ids: list[int]) -> dict[int, Optional[str]]:
+    """Batch-compute warm_state_since for many senders in a single query.
+
+    Returns {sender_email_id: timestamp_of_oldest_consecutive_same-state_row_or_None}.
+    Replaces N-sequential Supabase round-trips (the previous per-sender helper
+    made /sender-performance hang on ~90 senders).
+    """
+    if not sender_ids:
+        return {}
     try:
         rows = (
             get_supabase()
             .table("sender_email_performance")
-            .select("snapshot_date,warmup_score,in_recovery,fetched_at")
-            .eq("sender_email_id", sender_email_id)
+            .select("sender_email_id,snapshot_date,warmup_score,in_recovery,fetched_at")
+            .in_("sender_email_id", sender_ids)
+            .order("sender_email_id")
             .order("snapshot_date", desc=True)
-            .limit(60)
             .execute()
             .data or []
         )
     except Exception as e:
-        logger.debug(f"warm_state history lookup failed for {sender_email_id}: {e}")
-        return None
-    last_same = None
-    for row in rows:
-        if _compute_warm_state(row) == current_state:
-            last_same = row
-        else:
-            break
-    if last_same:
-        return last_same.get("fetched_at") or last_same.get("snapshot_date")
-    return None
+        logger.debug(f"warm_state batch lookup failed: {e}")
+        return {sid: None for sid in sender_ids}
+
+    by_sender: dict[int, list[dict]] = {}
+    for r in rows:
+        sid = r.get("sender_email_id")
+        if sid is None:
+            continue
+        by_sender.setdefault(int(sid), []).append(r)
+
+    out: dict[int, Optional[str]] = {}
+    for sid in sender_ids:
+        history = by_sender.get(sid, [])
+        if not history:
+            out[sid] = None
+            continue
+        current_state = _compute_warm_state(history[0])
+        last_same = history[0]
+        for row in history[1:]:
+            if _compute_warm_state(row) == current_state:
+                last_same = row
+            else:
+                break
+        out[sid] = last_same.get("fetched_at") or last_same.get("snapshot_date")
+    return out
 
 
 def _effective_daily_limit(row: dict, daily_limit: Optional[int]) -> Optional[int]:
@@ -1084,6 +1123,7 @@ def _effective_daily_limit(row: dict, daily_limit: Optional[int]) -> Optional[in
 def _enrich_sender_perf(rows: list[dict], history: bool = False) -> list[dict]:
     sender_ids = [int(r["sender_email_id"]) for r in rows if r.get("sender_email_id") is not None]
     volume_map = _today_volume_map(sender_ids) if not history else {}
+    since_map = _warm_state_since_map(sender_ids) if not history else {}
     enriched: list[dict] = []
     for row in rows:
         state = _compute_warm_state(row)
@@ -1092,7 +1132,7 @@ def _enrich_sender_perf(rows: list[dict], history: bool = False) -> list[dict]:
         daily_limit = vol_row.get("daily_limit")
         out = dict(row)
         out["warm_state"] = state
-        out["warm_state_since"] = _warm_state_since(sid, state) if sid is not None and not history else None
+        out["warm_state_since"] = since_map.get(sid) if sid is not None and not history else None
         out["daily_volume_today"] = int(vol_row.get("emails_sent") or 0) if not history else None
         out["daily_limit_effective"] = _effective_daily_limit(row, daily_limit)
         enriched.append(out)
@@ -1204,7 +1244,7 @@ class CountsResponse(BaseModel):
     notifications: NotificationCounts
 
 
-_COUNTS_TTL = 5
+_COUNTS_TTL = 30
 _STATUS_BUCKETS = {"active": "live", "launching": "live", "paused": "paused", "draft": "draft", "completed": "completed", "archived": "completed"}
 
 
@@ -1336,31 +1376,42 @@ def _notification_counts() -> NotificationCounts:
     return NotificationCounts(unread=len(rows), critical=critical, warning=warning, urgent=critical > 0)
 
 
+def _fetch_campaigns_list() -> list:
+    try:
+        return emailbison.get_campaigns()
+    except Exception as e:
+        logger.warning(f"EmailBison campaigns fetch failed for /counts: {e}")
+        return []
+
+
 @app.get("/counts", dependencies=[Security(require_api_key)], response_model=CountsResponse)
 def get_counts(workspace_id: Optional[str] = None):
     """
     Aggregated counts powering sidebar badges and hero summaries.
-    Cached for 5 seconds. Single call replaces 6 full-collection fetches on the client.
+    Cached for 5 seconds. Sub-aggregates are fanned out in parallel so the
+    endpoint's latency is bounded by the slowest single query.
     """
     cache_key = f"counts:{workspace_id or 'default'}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    try:
-        campaigns_list = emailbison.get_campaigns()
-    except Exception as e:
-        logger.warning(f"EmailBison campaigns fetch failed for /counts: {e}")
-        campaigns_list = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        campaigns_f = pool.submit(_fetch_campaigns_list)
+        leads_f = pool.submit(_leads_total)
+        senders_f = pool.submit(_sender_counts)
+        replies_f = pool.submit(_reply_counts)
+        domains_f = pool.submit(_domain_counts)
+        notifs_f = pool.submit(_notification_counts)
 
-    response = CountsResponse(
-        campaigns=_bucket_campaigns(campaigns_list),
-        leads=LeadCounts(total=_leads_total()),
-        senders=_sender_counts(),
-        replies=_reply_counts(),
-        domains=_domain_counts(),
-        notifications=_notification_counts(),
-    )
+        response = CountsResponse(
+            campaigns=_bucket_campaigns(campaigns_f.result()),
+            leads=LeadCounts(total=leads_f.result()),
+            senders=senders_f.result(),
+            replies=replies_f.result(),
+            domains=domains_f.result(),
+            notifications=notifs_f.result(),
+        )
     _cache_set(cache_key, response, _COUNTS_TTL)
     return response
 
