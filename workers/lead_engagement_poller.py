@@ -114,7 +114,7 @@ def poll_lead_engagement() -> None:
                 "email": lead.get("email"),
                 "title": lead.get("title"),
                 "company": lead.get("company"),
-                "lead_status": lead.get("status"),
+                "status": lead.get("status"),
                 "tags": lead.get("tags"),
                 "emails_sent": emails_sent,
                 "opens": opens,
