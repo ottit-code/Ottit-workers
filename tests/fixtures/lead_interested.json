@@ -1,0 +1,43 @@
+{
+  "event": { "type": "LEAD_INTERESTED" },
+  "data": {
+    "reply": {
+      "id": 91423,
+      "uuid": "31a04c41-1bf6-4dab-a0a8-bb2a90b89195",
+      "text_body": "Hey Saman,\n\nThis is actually pretty relevant — our monthly close is brutal right now and the team is burned out. Curious how you'd typically scope something like this for a 200-person SaaS.\n\nWhat do you charge for a pilot?\n\nThanks,\nJames\n\nOn Mon, Mar 4, 2026 at 10:21 AM Saman wrote:\n> Hi James, quick thought on month-end close drag...\n",
+      "html_body": null,
+      "email_subject": "Re: monthly close drag at Acme?",
+      "raw_message_id": "<reply-91423@bisonemails.com>",
+      "from_email_address": "james@acmehealth.io",
+      "from_name": "James Holt",
+      "received_at": "2026-03-04T15:42:11Z"
+    },
+    "lead": {
+      "id": 4567,
+      "first_name": "James",
+      "last_name": "Holt",
+      "email": "james@acmehealth.io",
+      "title": "CFO",
+      "company": "Acme Healthcare",
+      "custom_variables": [
+        { "name": "personalization_line", "value": "monthly close drag" },
+        { "name": "industry", "value": "Healthcare SaaS" }
+      ]
+    },
+    "campaign": {
+      "id": 332,
+      "name": "Monthly close acceleration Q2"
+    },
+    "scheduled_email": {
+      "raw_message_id": "<outbound-887766@bisonemails.com>",
+      "sequence_step_id": 12,
+      "sequence_step_order": 2,
+      "sequence_step_variant": 1
+    },
+    "sender_email": {
+      "id": 25065,
+      "email": "saman@send.ottit.com",
+      "type": "google_workspace_oauth"
+    }
+  }
+}

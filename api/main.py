@@ -54,8 +54,12 @@ from lib import emailbison, emailguard, config
 from lib.supabase_client import get_supabase
 from api.logging_utils import log_action
 from lib.notifications import create_notification
+from api.routers.drafter_inbound import router as drafter_inbound_router
+from api.routers.drafter_admin import router as drafter_admin_router
 
 app = FastAPI(title="Ottit CRM API", version="1.0.0")
+app.include_router(drafter_inbound_router)
+app.include_router(drafter_admin_router)
 
 _cors_origins = config.ALLOWED_ORIGINS if config.ALLOWED_ORIGINS else ["*"]
 app.add_middleware(
