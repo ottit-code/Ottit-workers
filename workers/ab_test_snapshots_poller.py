@@ -67,9 +67,14 @@ def _empty_agg() -> dict:
 
 
 def _compute_significance(supabase, parent_a: dict, variant_a: dict) -> tuple:
-    """Call compute_ab_significance RPC. Returns (confidence, winner, sample_sufficient)."""
+    """Call compute_ab_significance RPC. Returns (confidence, winner, sample_sufficient).
+
+    Schema override: this RPC lives in `public` (it predates the v1 cutover
+    and was not migrated). The default client schema is `v1`, so we have to
+    pin this one call to `public`.
+    """
     try:
-        result = supabase.rpc("compute_ab_significance", {
+        result = supabase.schema("public").rpc("compute_ab_significance", {
             "conversions_a": parent_a.get("unique_replies", 0),
             "samples_a": parent_a.get("emails_sent", 0),
             "conversions_b": variant_a.get("unique_replies", 0),

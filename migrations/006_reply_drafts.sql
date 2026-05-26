@@ -2,9 +2,15 @@
 -- Ottit Drafter — Migration 006: reply_drafts table
 -- Stores AI-generated reply drafts keyed by Bison reply UUID
 -- for race-safe idempotency. One row per LEAD_INTERESTED event.
+--
+-- Schema: v1 (cutover from `public` happened in the live project).
+-- The repo's Supabase client sets schema="v1" globally, so all
+-- worker code already targets these objects without prefixes.
 -- ============================================================
 
-create table if not exists public.reply_drafts (
+create schema if not exists v1;
+
+create table if not exists v1.reply_drafts (
     id                     uuid primary key default gen_random_uuid(),
     reply_id               text not null,
     bison_reply_uuid       text not null unique,
@@ -28,9 +34,9 @@ create table if not exists public.reply_drafts (
     created_at             timestamptz not null default now()
 );
 
-create index if not exists idx_reply_drafts_reply_id   on public.reply_drafts(reply_id);
-create index if not exists idx_reply_drafts_lead_id    on public.reply_drafts(lead_id);
-create index if not exists idx_reply_drafts_created_at on public.reply_drafts(created_at desc);
+create index if not exists idx_reply_drafts_reply_id   on v1.reply_drafts(reply_id);
+create index if not exists idx_reply_drafts_lead_id    on v1.reply_drafts(lead_id);
+create index if not exists idx_reply_drafts_created_at on v1.reply_drafts(created_at desc);
 
-comment on table public.reply_drafts is
+comment on table v1.reply_drafts is
   'AI-generated reply drafts. One row per LEAD_INTERESTED event; bison_reply_uuid enforces idempotency.';

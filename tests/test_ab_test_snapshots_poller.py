@@ -65,15 +65,19 @@ class TestAggregateScheduledEmails:
 
 
 class TestComputeSignificance:
+    # `compute_ab_significance` lives in the `public` schema (not migrated to v1),
+    # so the caller pins the schema explicitly:
+    #     supabase.schema("public").rpc("compute_ab_significance", ...)
+    # Mocks below set up that chain.
     def test_returns_none_tuple_when_rpc_unavailable(self):
         sb = MagicMock()
-        sb.rpc.side_effect = Exception("RPC not found")
+        sb.schema.return_value.rpc.side_effect = Exception("RPC not found")
         result = _compute_significance(sb, {"unique_replies": 5, "emails_sent": 100}, {})
         assert result == (None, None, None)
 
     def test_extracts_values_from_dict_response(self):
         sb = MagicMock()
-        sb.rpc.return_value.execute.return_value.data = {
+        sb.schema.return_value.rpc.return_value.execute.return_value.data = {
             "stat_confidence": 95.0,
             "stat_winner": "variant",
             "stat_sample_sufficient": True,
@@ -87,7 +91,7 @@ class TestComputeSignificance:
 
     def test_extracts_values_from_list_response(self):
         sb = MagicMock()
-        sb.rpc.return_value.execute.return_value.data = [
+        sb.schema.return_value.rpc.return_value.execute.return_value.data = [
             {"stat_confidence": 80.0, "stat_winner": "control", "stat_sample_sufficient": False}
         ]
         result = _compute_significance(sb, {}, {})
@@ -98,6 +102,9 @@ class TestPollAbTestSnapshots:
     def _make_supabase(self):
         sb = MagicMock()
         sb.table.return_value.upsert.return_value.execute.return_value.data = []
+        # compute_ab_significance lives in `public`, so the caller chains via
+        # supabase.schema("public").rpc(...). Wire both paths to be safe.
+        sb.schema.return_value.rpc.return_value.execute.return_value.data = None
         sb.rpc.return_value.execute.return_value.data = None
         return sb
 
@@ -174,7 +181,10 @@ class TestPollAbTestSnapshots:
         ):
             poll_ab_test_snapshots()
 
-        sb.rpc.assert_called_once_with("compute_ab_significance", {
+        # The RPC lives in `public` (not migrated to v1), so the caller pins the
+        # schema explicitly: supabase.schema("public").rpc(...).
+        sb.schema.assert_called_with("public")
+        sb.schema.return_value.rpc.assert_called_once_with("compute_ab_significance", {
             "conversions_a": 5,
             "samples_a": 1,
             "conversions_b": 3,

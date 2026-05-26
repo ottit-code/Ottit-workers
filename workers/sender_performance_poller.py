@@ -125,9 +125,12 @@ def _fetch_sender_lookup_data(supabase, sender_ids: list[int]) -> dict[int, dict
 
 
 def _compute_health_score(supabase, reply_rate: float, bounce_rate: float, db: dict) -> int | None:
-    """Call compute_sender_health_score RPC. Returns None if RPC is not available."""
+    """Call compute_sender_health_score RPC. Returns None if RPC is not available.
+
+    Schema override: this RPC lives in `public` (not migrated to v1).
+    """
     try:
-        result = supabase.rpc("compute_sender_health_score", {
+        result = supabase.schema("public").rpc("compute_sender_health_score", {
             "warmup_score": db.get("warmup_score"),
             "reply_rate": reply_rate,
             "bounce_rate": bounce_rate,

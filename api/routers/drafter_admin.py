@@ -18,13 +18,23 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Security, HTTPException
 from pydantic import BaseModel, Field
 
 from api.routers.drafter_deps import require_admin_key
-from lib import emailbison, openai_embed, rag, reply_drafts_dao, reply_parser
+from lib import drafter, emailbison, openai_embed, rag, reply_drafts_dao, reply_parser
 from lib.supabase_client import get_supabase
+from models.bison_payload import (
+    BisonCampaign,
+    BisonCustomVariable,
+    BisonLead,
+    BisonLeadInterestedData,
+    BisonReply,
+    BisonScheduledEmail,
+    BisonSenderEmail,
+)
 from prompts.templates import format_voice_example_content
 
 logger = logging.getLogger(__name__)
@@ -318,4 +328,122 @@ def voice_example_stats() -> VoiceExampleStats:
         recommended_action=rec_action,
         recommended_lists=rec_lists,
         healthy=rec_action is None,
+    )
+
+
+# --- /admin/draft-test ----------------------------------------------------
+#
+# Convenience endpoint for ad-hoc testing of the drafter pipeline without
+# crafting a full Bison webhook payload. Pass just the prospect's email body
+# (plus optional context) and we build a synthetic BisonLeadInterestedData
+# under the hood and run it through `drafter.run` exactly like the real
+# webhook would.
+#
+# WARNING: this hits paid LLM APIs (Claude + OpenAI embeddings) and writes a
+# real row to v1.reply_drafts. Use sparingly. Test rows are easy to spot —
+# they default to lead_email='test-lead@example.com' and the bison_reply_uuid
+# is freshly minted per call so collisions never happen.
+
+
+class DraftTestRequest(BaseModel):
+    """Minimum: just `email_body`. Everything else has sensible defaults so a
+    one-line curl works."""
+    email_body: str = Field(
+        ...,
+        min_length=1,
+        description="Raw text of the prospect's reply. Quoted-thread will be stripped.",
+    )
+
+    # Optional context — fills the same fields the real Bison payload supplies.
+    subject: str = "Re: quick question"
+    lead_first_name: str = "Friend"
+    lead_last_name: Optional[str] = None
+    lead_email: str = "test-lead@example.com"
+    lead_company: Optional[str] = None
+    lead_title: Optional[str] = None
+    lead_id: int = 0
+    sender_email: str = "saman@ottit.com"
+    sender_email_id: int = 0
+    campaign_id: int = 0
+    campaign_name: str = "Manual draft test"
+    custom_variables: Dict[str, str] = Field(default_factory=dict)
+
+
+def _build_synthetic_payload(req: DraftTestRequest) -> BisonLeadInterestedData:
+    """Map a DraftTestRequest into the real BisonLeadInterestedData shape."""
+    return BisonLeadInterestedData(
+        reply=BisonReply(
+            id=0,
+            uuid=str(uuid4()),  # fresh per call so we never trip idempotency
+            text_body=req.email_body,
+            email_subject=req.subject,
+            from_email_address=req.lead_email,
+            from_name=" ".join(filter(None, [req.lead_first_name, req.lead_last_name])) or None,
+        ),
+        lead=BisonLead(
+            id=req.lead_id,
+            first_name=req.lead_first_name,
+            last_name=req.lead_last_name,
+            email=req.lead_email,
+            title=req.lead_title,
+            company=req.lead_company,
+            custom_variables=[
+                BisonCustomVariable(name=k, value=v) for k, v in req.custom_variables.items()
+            ],
+        ),
+        campaign=BisonCampaign(id=req.campaign_id, name=req.campaign_name),
+        scheduled_email=BisonScheduledEmail(),
+        sender_email=BisonSenderEmail(id=req.sender_email_id, email=req.sender_email),
+    )
+
+
+# Late import to avoid a circular dep at module load time. The inbound router
+# already exposes these — we reuse them so the response shape is identical.
+from api.routers.drafter_inbound import (  # noqa: E402
+    ContextBlock,
+    DraftBody,
+    DraftResponse,
+)
+
+
+@router.post(
+    "/admin/draft-test",
+    response_model=DraftResponse,
+    dependencies=[Security(require_admin_key)],
+)
+def draft_test(body: DraftTestRequest) -> DraftResponse:
+    """Drive the drafter with a raw email body (no Bison webhook required).
+
+    Returns the same JSON shape as POST /webhooks/bison/lead-interested so
+    you can sanity-check Slack rendering, voice adherence, and confidence
+    scoring without going through n8n.
+    """
+    payload = _build_synthetic_payload(body)
+    try:
+        result = drafter.run(payload)
+    except drafter.DrafterError as exc:
+        logger.error("draft_test.drafter_error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        logger.exception("draft_test.unexpected_error")
+        raise HTTPException(status_code=500, detail=f"Drafter pipeline failed: {exc}")
+
+    return DraftResponse(
+        bison_reply_uuid=result.bison_reply_uuid,
+        draft_id=result.draft_id,
+        skipped_reason="duplicate" if result.duplicate else None,
+        draft=DraftBody(
+            subject=result.subject,
+            body=result.body,
+            human_review_needed=result.human_review_needed,
+            review_reason=result.review_reason,
+        ),
+        confidence=result.confidence,
+        context=ContextBlock(
+            rag_examples_used=result.rag_examples_used,
+            model_primary=result.model_primary,
+            model_ensemble=result.model_ensemble,
+        ),
+        slack=result.slack,
+        clean_prospect_reply=result.clean_prospect_reply,
     )
