@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from lib import emailbison, emailguard, config  # noqa: F401
 from lib.supabase_client import get_supabase
+from lib.supabase_paginate import fetch_all
 from api.logging_utils import log_action
 from lib.notifications import create_notification
 from api.deps import (  # noqa: F401
@@ -105,24 +106,39 @@ def _bucket_campaigns(campaigns: list) -> CampaignCounts:
     return CampaignCounts(total=len(campaigns), **buckets)
 
 
-def _leads_total() -> int:
+def _target_workspaces(ws: Optional[str]) -> list:
+    """Bison workspaces to aggregate over: one when filtered, else all pollable."""
+    pollable = config.pollable_workspaces()
+    if ws:
+        return [w for w in pollable if w["id"] == ws]
+    return pollable
+
+
+def _leads_total(ws: Optional[str]) -> int:
+    total = 0
+    got_live = False
+    for w in _target_workspaces(ws):
+        try:
+            resp = emailbison.for_workspace(w["id"]).get_leads_paginated(page=1, per_page=1)
+            if isinstance(resp, dict):
+                meta = resp.get("meta") or {}
+                if "total" in meta:
+                    total += int(meta["total"])
+                    got_live = True
+        except Exception as e:
+            logger.debug(f"EmailBison leads total failed for {w['id']}: {e}")
+    if got_live:
+        return total
     try:
-        resp = emailbison.get_leads_paginated(page=1, per_page=1)
-        if isinstance(resp, dict):
-            meta = resp.get("meta") or {}
-            if "total" in meta:
-                return int(meta["total"])
-    except Exception as e:
-        logger.debug(f"EmailBison leads pagination total failed: {e}")
-    try:
-        latest = (
+        q = (
             get_supabase()
             .table("lead_engagement_snapshots")
             .select("lead_id", count="exact")
             .eq("snapshot_date", _today())
-            .limit(1)
-            .execute()
         )
+        if ws:
+            q = q.eq("workspace_id", ws)
+        latest = q.limit(1).execute()
         if latest.count is not None:
             return int(latest.count)
     except Exception as e:
@@ -130,57 +146,81 @@ def _leads_total() -> int:
     return 0
 
 
-def _sender_counts() -> SenderCounts:
+def _sender_counts(ws: Optional[str]) -> SenderCounts:
+    # Bison sender IDs are per-workspace integers and collide across
+    # workspaces, so all dedup keys must include workspace_id.
     supabase = get_supabase()
-    try:
-        perf_rows = (
-            supabase.table("sender_email_performance")
-            .select("sender_email_id,warmup_score,in_recovery")
-            .eq("snapshot_date", _today())
-            .execute()
-            .data or []
-        )
-        if not perf_rows:
-            perf_rows = supabase.rpc("get_latest_sender_stats", {}).execute().data or []
-    except Exception as e:
-        logger.warning(f"sender performance count lookup failed: {e}")
-        perf_rows = []
+
+    # Per-workspace: today's snapshot when present, else that workspace's
+    # latest snapshot (matches what the Senders page shows). A workspace with
+    # no data today (e.g. V1 after its senders moved to V2) would otherwise
+    # vanish from the "all" total.
+    ws_ids = [w["id"] for w in _target_workspaces(ws)] or ([ws] if ws else [])
+    perf_rows: list = []
+    for wid in ws_ids:
+        try:
+            rows = fetch_all(
+                lambda wid=wid: supabase.table("sender_email_performance")
+                .select("workspace_id,sender_email_id,warmup_score,in_recovery")
+                .eq("snapshot_date", _today())
+                .eq("workspace_id", wid)
+                .order("sender_email_id")
+            )
+            if not rows:
+                rows = (
+                    supabase.rpc("get_latest_sender_stats", {"p_workspace_id": wid})
+                    .execute().data or []
+                )
+            perf_rows.extend(rows)
+        except Exception as e:
+            logger.warning(f"sender performance count lookup failed for {wid}: {e}")
 
     warmed = sum(1 for r in perf_rows if _compute_warm_state(r) == "warmed")
     throttled = sum(1 for r in perf_rows if r.get("in_recovery"))
 
-    sending_today = 0
-    try:
-        rows = (
+    def _sending_query():
+        q = (
             supabase.table("sender_daily_stats")
-            .select("sender_email_id")
+            .select("workspace_id,sender_email_id")
             .eq("stat_date", _today())
             .gt("emails_sent", 0)
-            .execute()
-            .data or []
         )
-        sending_today = len({r.get("sender_email_id") for r in rows if r.get("sender_email_id") is not None})
+        if ws:
+            q = q.eq("workspace_id", ws)
+        return q.order("workspace_id").order("sender_email_id")
+
+    sending_today = 0
+    try:
+        rows = fetch_all(_sending_query)
+        sending_today = len({
+            (r.get("workspace_id"), r.get("sender_email_id"))
+            for r in rows if r.get("sender_email_id") is not None
+        })
     except Exception as e:
         logger.warning(f"sender_daily_stats sending_today lookup failed: {e}")
 
     return SenderCounts(
-        total=len({r.get("sender_email_id") for r in perf_rows}),
+        total=len({(r.get("workspace_id"), r.get("sender_email_id")) for r in perf_rows}),
         sending_today=sending_today,
         warmed=warmed,
         throttled=throttled,
     )
 
 
-def _reply_counts() -> ReplyCounts:
+def _reply_counts(ws: Optional[str]) -> ReplyCounts:
     supabase = get_supabase()
     total = 0
     pending = 0
     try:
-        res = supabase.table("reply_events").select("reply_id", count="exact").limit(1).execute()
+        q = supabase.table("reply_events").select("reply_id", count="exact")
+        if ws:
+            q = q.eq("workspace_id", ws)
+        res = q.limit(1).execute()
         total = int(res.count or 0)
     except Exception as e:
         logger.warning(f"reply_events count failed: {e}")
     try:
+        # reply_review_state has no workspace column — pending stays global.
         res = (
             supabase.table("reply_review_state")
             .select("reply_id", count="exact")
@@ -223,31 +263,36 @@ def _notification_counts() -> NotificationCounts:
     return NotificationCounts(unread=len(rows), critical=critical, warning=warning, urgent=critical > 0)
 
 
-def _fetch_campaigns_list() -> list:
-    try:
-        return emailbison.get_campaigns()
-    except Exception as e:
-        logger.warning(f"EmailBison campaigns fetch failed for /counts: {e}")
-        return []
+def _fetch_campaigns_list(ws: Optional[str]) -> list:
+    out: list = []
+    for w in _target_workspaces(ws):
+        try:
+            out.extend(emailbison.for_workspace(w["id"]).get_campaigns())
+        except Exception as e:
+            logger.warning(f"EmailBison campaigns fetch failed for /counts ({w['id']}): {e}")
+    return out
 
 
 @router.get("/counts", dependencies=[Security(require_api_key)], response_model=CountsResponse)
 def get_counts(workspace_id: Optional[str] = None):
     """
-    Aggregated counts powering sidebar badges and hero summaries.
-    Cached for 5 seconds. Sub-aggregates are fanned out in parallel so the
+    Aggregated counts powering sidebar badges and hero summaries, scoped to
+    the selected workspace ("all"/absent = every pollable workspace).
+    Cached briefly. Sub-aggregates are fanned out in parallel so the
     endpoint's latency is bounded by the slowest single query.
+    Domains and notifications have no workspace dimension — always global.
     """
-    cache_key = f"counts:{workspace_id or 'default'}"
+    ws = workspace_id if workspace_id and workspace_id != "all" else None
+    cache_key = f"counts:{ws or 'all'}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
     with ThreadPoolExecutor(max_workers=6) as pool:
-        campaigns_f = pool.submit(_fetch_campaigns_list)
-        leads_f = pool.submit(_leads_total)
-        senders_f = pool.submit(_sender_counts)
-        replies_f = pool.submit(_reply_counts)
+        campaigns_f = pool.submit(_fetch_campaigns_list, ws)
+        leads_f = pool.submit(_leads_total, ws)
+        senders_f = pool.submit(_sender_counts, ws)
+        replies_f = pool.submit(_reply_counts, ws)
         domains_f = pool.submit(_domain_counts)
         notifs_f = pool.submit(_notification_counts)
 
@@ -290,13 +335,18 @@ def get_lead_pipeline_summary(workspace_id: Optional[str] = None, campaign_id: O
     Each lead is attributed to its highest-reached stage. Percentages computed server-side.
     """
     supabase = get_supabase()
-    try:
-        query = (
+    ws = workspace_id if workspace_id and workspace_id != "all" else None
+
+    def _snapshot_query(snapshot_date: str):
+        q = (
             supabase.table("lead_engagement_snapshots")
             .select("lead_id,funnel_stage,snapshot_date,campaign_engagements")
-            .eq("snapshot_date", _today())
+            .eq("snapshot_date", snapshot_date)
         )
-        rows = query.execute().data or []
+        return q.eq("workspace_id", ws) if ws else q
+
+    try:
+        rows = _snapshot_query(_today()).execute().data or []
         if not rows:
             latest = (
                 supabase.table("lead_engagement_snapshots")
@@ -307,13 +357,7 @@ def get_lead_pipeline_summary(workspace_id: Optional[str] = None, campaign_id: O
                 .data or []
             )
             if latest:
-                rows = (
-                    supabase.table("lead_engagement_snapshots")
-                    .select("lead_id,funnel_stage,snapshot_date,campaign_engagements")
-                    .eq("snapshot_date", latest[0]["snapshot_date"])
-                    .execute()
-                    .data or []
-                )
+                rows = _snapshot_query(latest[0]["snapshot_date"]).execute().data or []
     except Exception:
         raise
 
@@ -333,13 +377,14 @@ def get_lead_pipeline_summary(workspace_id: Optional[str] = None, campaign_id: O
             stage_counts[stage] += 1
 
     try:
-        unsub_rows = (
+        unsub_q = (
             supabase.table("reply_events")
             .select("lead_id", count="exact")
             .eq("folder", "unsubscribed")
-            .limit(1)
-            .execute()
         )
+        if ws:
+            unsub_q = unsub_q.eq("workspace_id", ws)
+        unsub_rows = unsub_q.limit(1).execute()
         stage_counts["unsubscribed"] = int(unsub_rows.count or 0)
     except Exception as e:
         logger.debug(f"unsubscribed count lookup failed: {e}")
@@ -459,9 +504,11 @@ def get_activity_feed(limit: int = 20, workspace_id: Optional[str] = None):
         limit = 50
 
     supabase = get_supabase()
+    ws = workspace_id if workspace_id and workspace_id != "all" else None
     pool_size = limit * 3
 
     try:
+        # Notifications have no workspace column — always global.
         notifications = (
             supabase.table("notifications")
             .select(_NOTIFICATION_COLS)
@@ -475,14 +522,14 @@ def get_activity_feed(limit: int = 20, workspace_id: Optional[str] = None):
         notifications = []
 
     try:
-        replies = (
+        replies_q = (
             supabase.table("reply_events")
             .select("reply_id,lead_id,lead_email,campaign_name,subject,classification,replied_at")
             .order("replied_at", desc=True)
-            .limit(pool_size)
-            .execute()
-            .data or []
         )
+        if ws:
+            replies_q = replies_q.eq("workspace_id", ws)
+        replies = replies_q.limit(pool_size).execute().data or []
     except Exception as e:
         logger.warning(f"activity-feed reply_events query failed: {e}")
         replies = []

@@ -133,26 +133,39 @@ def check_bounce_rate_spike(sender_rows: list, notified: set) -> None:
 
 
 def check_daily_limit_approaching(sender_rows: list, notified: set) -> None:
-    """Alert if sender used 90%+ of its daily limit *today* (delta-based —
-    the raw emails_sent counter is cumulative lifetime, not per-day)."""
+    """One summary per workspace when senders hit 90%+ of their daily limit.
+
+    Hitting the limit is normal for a fleet at fixed caps (warmup senders at
+    10/day reach it every day) — a per-sender alert produced hundreds of
+    notifications daily and drowned the activity feed, so this rolls them up.
+    Delta-based: raw emails_sent counters are cumulative lifetime, not per-day.
+    """
+    at_limit: dict[str, list] = {}
     for row in sender_rows:
         limit = row.get("daily_limit", 0) or 0
         sent = row.get("sent_today")
-        if sent is None:
+        if sent is None or limit <= 0:
             continue
-        if limit > 0 and sent / limit >= 0.9:
-            entity_id = str(row["sender_email_id"])
-            if ("daily_limit_approaching", entity_id) not in notified:
-                pct = f"{(sent / limit * 100):.0f}%"
-                create_notification(
-                    severity="info",
-                    type_="daily_limit_approaching",
-                    title=f"Sender near daily limit: {row.get('sender_email', entity_id)}",
-                    body=f"Used {sent}/{limit} sends today ({pct}).",
-                    entity_type="sender",
-                    entity_id=entity_id,
-                )
-                notified.add(("daily_limit_approaching", entity_id))
+        if sent / limit >= 0.9:
+            at_limit.setdefault(row.get("workspace_id") or "unknown", []).append(row)
+
+    for workspace_id, rows in at_limit.items():
+        entity_id = workspace_id
+        if ("daily_limit_approaching", entity_id) in notified:
+            continue
+        sample = ", ".join(
+            str(r.get("sender_email") or r.get("sender_email_id")) for r in rows[:3]
+        )
+        more = f" and {len(rows) - 3} more" if len(rows) > 3 else ""
+        create_notification(
+            severity="info",
+            type_="daily_limit_approaching",
+            title=f"{len(rows)} senders at/near daily limit ({workspace_id})",
+            body=f"Used 90%+ of their daily send limit today: {sample}{more}.",
+            entity_type="workspace",
+            entity_id=entity_id,
+        )
+        notified.add(("daily_limit_approaching", entity_id))
 
 
 def _normalize_tags(raw) -> list[str]:
