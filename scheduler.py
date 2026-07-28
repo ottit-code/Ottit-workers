@@ -2,18 +2,16 @@
 scheduler.py — main entry point
 
 Runs all pollers on their schedules:
-- stats_poller:                  every 6 hours
-- delivery_poller:               every 2 hours
+- deep_refresh:                  every 3 hours at 00/03/06/09/12/15/18/21 UTC
+                                 (stats, campaign daily stats, sender
+                                 performance, reply events, deliverability,
+                                 InboxAssure — run sequentially)
 - notifier:                      every 15 minutes
 - ab_test_snapshots_poller:      every 6 hours
-- reply_events_poller:           every 4 hours
-- campaign_daily_stats_poller:   daily at midnight
-- sender_performance_poller:     daily at 1 AM
 - lead_engagement_poller:        daily at 2 AM
 - domain_blacklist_poller:       every 12 hours
 - dns_check_poller:              every 12 hours
 - placement_schedule_runner:     every 15 minutes
-- inboxassure_poller:            hourly (no-op until INBOXASSURE_API_TOKEN set)
 - send_plan_snapshotter:         daily at 00:05 UTC (captures the day's plan)
 
 NOTE: The action API server must be run separately:
@@ -21,21 +19,15 @@ NOTE: The action API server must be run separately:
 """
 
 import logging
-import time
 from apscheduler.schedulers.blocking import BlockingScheduler
 from workers import (
-    stats_poller,
-    delivery_poller,
+    deep_refresh,
     notifier,
     ab_test_snapshots_poller,
-    campaign_daily_stats_poller,
     lead_engagement_poller,
-    reply_events_poller,
-    sender_performance_poller,
     domain_blacklist_poller,
     dns_check_poller,
     placement_schedule_runner,
-    inboxassure_poller,
     send_plan_snapshotter,
 )
 
@@ -47,41 +39,29 @@ logger = logging.getLogger(__name__)
 
 scheduler = BlockingScheduler()
 
+# Fixed refresh slots (UTC). The dashboard's refresh button shows this cadence.
+REFRESH_HOURS = "0,3,6,9,12,15,18,21"
+
 
 def main():
     # Run immediately on startup
     logger.info("Running initial poll on startup")
-    stats_poller.run()
-    delivery_poller.run()
+    deep_refresh.run()
     notifier.run()
     ab_test_snapshots_poller.run()
-    campaign_daily_stats_poller.run()
-    reply_events_poller.run()
-    sender_performance_poller.run()
     domain_blacklist_poller.run()
     dns_check_poller.run()
-    inboxassure_poller.run()  # no-op until INBOXASSURE_API_TOKEN is set
     # lead_engagement_poller is intentionally skipped on startup — 48 k leads
     # is expensive; let the scheduled 2 AM run handle it.
 
     # Schedule recurring jobs — max_instances=1 + coalesce prevent stacked runs
     # if a job takes longer than its interval.
-    scheduler.add_job(stats_poller.run, "interval", hours=6,
-                      id="stats_poller", max_instances=1, coalesce=True)
-    scheduler.add_job(delivery_poller.run, "interval", hours=2,
-                      id="delivery_poller", max_instances=1, coalesce=True)
+    scheduler.add_job(deep_refresh.run, "cron", hour=REFRESH_HOURS, minute=0,
+                      id="deep_refresh", max_instances=1, coalesce=True)
     scheduler.add_job(notifier.run, "interval", minutes=15,
                       id="notifier", max_instances=1, coalesce=True)
-
-    # New pollers
     scheduler.add_job(ab_test_snapshots_poller.run, "interval", hours=6,
                       id="ab_test_snapshots_poller", max_instances=1, coalesce=True)
-    scheduler.add_job(reply_events_poller.run, "interval", hours=4,
-                      id="reply_events_poller", max_instances=1, coalesce=True)
-    scheduler.add_job(campaign_daily_stats_poller.run, "cron", hour=0, minute=0,
-                      id="campaign_daily_stats_poller", max_instances=1, coalesce=True)
-    scheduler.add_job(sender_performance_poller.run, "cron", hour=1, minute=0,
-                      id="sender_performance_poller", max_instances=1, coalesce=True)
     scheduler.add_job(lead_engagement_poller.run, "cron", hour=2, minute=0,
                       id="lead_engagement_poller", max_instances=1, coalesce=True)
     scheduler.add_job(domain_blacklist_poller.run, "interval", hours=12,
@@ -90,8 +70,6 @@ def main():
                       id="dns_check_poller", max_instances=1, coalesce=True)
     scheduler.add_job(placement_schedule_runner.run, "interval", minutes=15,
                       id="placement_schedule_runner", max_instances=1, coalesce=True)
-    scheduler.add_job(inboxassure_poller.run, "interval", hours=1,
-                      id="inboxassure_poller", max_instances=1, coalesce=True)
     # Right after UTC midnight, before sending drains the queue. Not run on
     # startup: a mid-day capture would record an already-drained plan.
     scheduler.add_job(send_plan_snapshotter.run, "cron", hour=0, minute=5,
