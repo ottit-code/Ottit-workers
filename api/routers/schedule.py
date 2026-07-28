@@ -80,9 +80,10 @@ def schedule_today(workspace_id: Optional[str] = None):
                 if snap_rows:
                     # Fast path: remaining derived from the midnight plan and
                     # per-campaign sent-today (seconds, not minutes).
-                    campaigns.extend(
-                        send_schedule.plan_from_snapshot(ws, today, snap_rows)
-                    )
+                    fast = send_schedule.plan_from_snapshot(ws, today, snap_rows)
+                    for c in fast:
+                        c["overdue_today"] = None  # unknown without queue paging
+                    campaigns.extend(fast)
                     plan_total = (plan_total or 0) + sum(
                         int(r.get("planned") or 0) for r in snap_rows
                     )
@@ -101,12 +102,20 @@ def schedule_today(workspace_id: Optional[str] = None):
 
         campaigns.sort(key=lambda c: -c["planned_today"])
         remaining_total = sum(c["planned_today"] for c in campaigns)
+        overdues = [c.get("overdue_today") for c in campaigns]
+        overdue_total = (
+            sum(o for o in overdues if o is not None)
+            if any(o is not None for o in overdues) else None
+        )
         return {
             "date": today,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             # Back-compat: planned_total has always been the live queue.
             "planned_total": remaining_total,
             "remaining_total": remaining_total,
+            # Today's queue items whose scheduled slot passed unsent — they
+            # roll over to later days, so they're excluded from remaining.
+            "overdue_total": overdue_total,
             "plan_total": plan_total,
             "sent_total": sent_total,
             "campaigns": campaigns,

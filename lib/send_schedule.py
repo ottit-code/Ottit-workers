@@ -15,45 +15,61 @@ from lib import emailbison
 
 logger = logging.getLogger(__name__)
 
-# Safety cap per campaign. Bison pages at 15/page, so this allows ~7,500
-# queued emails per campaign — morning snapshots of a full day's plan must
-# fit, otherwise the "planned" count silently clips.
-MAX_PAGES = 500
+# Safety cap per campaign. Bison pages at 15/page and queues can hold weeks
+# of backlog (observed: 16k+ items / 1,100 pages on one campaign), so the cap
+# must be generous or today's counts silently clip.
+MAX_PAGES = 2000
 ACTIVE_STATUSES = {"active", "running"}
+_PAGE_WORKERS = 10
 
 
 def fetch_scheduled_emails(client, campaign_id: str) -> List[dict]:
-    """All scheduled emails for a campaign, following Laravel-style pagination."""
-    rows: List[dict] = []
-    page = 1
-    while page <= MAX_PAGES:
-        res = client.get(
-            f"/api/campaigns/{campaign_id}/scheduled-emails",
-            params={"page": page},
-        )
-        if isinstance(res, list):
-            rows.extend(res)
-            break
-        if not isinstance(res, dict):
-            break
-        batch = res.get("data") or []
-        if not isinstance(batch, list):
-            break
-        rows.extend(batch)
-        meta = res.get("meta") or {}
-        last_page = meta.get("last_page")
-        current = meta.get("current_page", page)
-        if not last_page or int(current) >= int(last_page):
-            break
-        page = int(current) + 1
+    """All scheduled emails for a campaign, following Laravel-style pagination.
+
+    Pages are fetched concurrently (Bison ignores per_page and always returns
+    15/page, so large queues would otherwise take minutes sequentially).
+    """
+    first = client.get(
+        f"/api/campaigns/{campaign_id}/scheduled-emails", params={"page": 1}
+    )
+    if isinstance(first, list):
+        return first
+    if not isinstance(first, dict):
+        return []
+    rows: List[dict] = list(first.get("data") or [])
+    meta = first.get("meta") or {}
+    last_page = min(int(meta.get("last_page") or 1), MAX_PAGES)
+    if last_page <= 1:
+        return rows
+
+    def one_page(page: int) -> list:
+        try:
+            res = client.get(
+                f"/api/campaigns/{campaign_id}/scheduled-emails",
+                params={"page": page},
+            )
+            return res.get("data") or [] if isinstance(res, dict) else []
+        except Exception as e:
+            logger.warning(
+                f"scheduled-emails page {page} failed for campaign {campaign_id}: {e}"
+            )
+            return []
+
+    with ThreadPoolExecutor(max_workers=_PAGE_WORKERS) as pool:
+        for batch in pool.map(one_page, range(2, last_page + 1)):
+            rows.extend(batch)
     return rows
 
 
-def scheduled_day_utc(item: dict) -> Optional[str]:
-    """UTC calendar date ("YYYY-MM-DD") an item is scheduled for, if parseable."""
+def scheduled_dt_utc(item: dict) -> Optional[datetime]:
+    """UTC datetime an item is scheduled for, if parseable.
+
+    Bison's canonical field is scheduled_date (UTC, Z-suffixed); the others
+    are fallbacks for older payload shapes.
+    """
     raw = None
-    for field in ("scheduled_at", "send_at", "send_time", "scheduled_datetime",
-                  "scheduled_date", "scheduled_for", "created_at"):
+    for field in ("scheduled_date", "scheduled_at", "send_at", "send_time",
+                  "scheduled_datetime", "scheduled_for"):
         raw = item.get(field)
         if raw:
             break
@@ -64,10 +80,22 @@ def scheduled_day_utc(item: dict) -> Optional[str]:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).date().isoformat()
+        return dt.astimezone(timezone.utc)
     except ValueError:
-        # Fall back to a bare leading date ("YYYY-MM-DD ...").
-        return text[:10] if len(text) >= 10 and text[4:5] == "-" else None
+        return None
+
+
+def scheduled_day_utc(item: dict) -> Optional[str]:
+    """UTC calendar date ("YYYY-MM-DD") an item is scheduled for, if parseable."""
+    dt = scheduled_dt_utc(item)
+    if dt is not None:
+        return dt.date().isoformat()
+    # Fall back to a bare leading date ("YYYY-MM-DD ...").
+    for field in ("scheduled_date", "scheduled_at", "send_at"):
+        text = str(item.get(field) or "").strip()
+        if len(text) >= 10 and text[4:5] == "-":
+            return text[:10]
+    return None
 
 
 def inbox_email(item: dict) -> str:
@@ -89,9 +117,16 @@ def inbox_email(item: dict) -> str:
 
 def plan_for_workspace(ws: dict, day: str) -> List[Dict[str, Any]]:
     """Queued sends for the given UTC day, per active campaign (with per-inbox
-    breakdown). Reflects Bison's *current* queue: emails already sent today
-    have left it."""
+    breakdown).
+
+    Bison's queue keeps items whose scheduled time has already passed without
+    sending (daily limits etc.) — those roll over to later days, so they are
+    NOT counted as remaining. planned_today = still-future items only;
+    overdue_today = today's items whose slot passed unsent. At midnight
+    (snapshotter) everything is future, so planned_today == the full plan.
+    """
     client = emailbison.for_workspace(ws["id"])
+    now = datetime.now(timezone.utc)
     campaigns = client.get_campaigns()
     active = [
         c for c in campaigns
@@ -106,6 +141,7 @@ def plan_for_workspace(ws: dict, day: str) -> List[Dict[str, Any]]:
             "campaign_id": cid,
             "campaign_name": c.get("name", ""),
             "planned_today": 0,
+            "overdue_today": 0,
             "inboxes": [],
             "error": None,
         }
@@ -117,7 +153,11 @@ def plan_for_workspace(ws: dict, day: str) -> List[Dict[str, Any]]:
             return entry
         per_inbox: Dict[str, int] = {}
         for item in items:
-            if scheduled_day_utc(item) != day:
+            dt = scheduled_dt_utc(item)
+            if dt is None or dt.date().isoformat() != day:
+                continue
+            if dt <= now:
+                entry["overdue_today"] += 1
                 continue
             entry["planned_today"] += 1
             inbox = inbox_email(item)
