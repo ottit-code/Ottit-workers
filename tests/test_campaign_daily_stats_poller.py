@@ -12,6 +12,27 @@ from workers.campaign_daily_stats_poller import (
 _MODULE = "workers.campaign_daily_stats_poller"
 
 
+def _mock_bison(details=None, chart=None, stats=None, details_side_effect=None,
+                chart_side_effect=None, stats_side_effect=None):
+    """Mock BisonClient — the poller resolves clients via for_workspace(),
+    so module-level function patches never intercept its calls."""
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    if details_side_effect is not None:
+        client.get_campaign_details.side_effect = details_side_effect
+    else:
+        client.get_campaign_details.return_value = details or {}
+    if chart_side_effect is not None:
+        client.get_campaign_line_area_chart_stats.side_effect = chart_side_effect
+    else:
+        client.get_campaign_line_area_chart_stats.return_value = chart or {}
+    if stats_side_effect is not None:
+        client.get_campaign_stats.side_effect = stats_side_effect
+    else:
+        client.get_campaign_stats.return_value = stats or {}
+    return client
+
+
 class TestSafeRate:
     def test_normal(self):
         assert _safe_rate(25, 100) == 25.0
@@ -90,10 +111,8 @@ class TestPollCampaignDailyStats:
 
         with (
             patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
-            patch("lib.emailbison.get_campaign_details", return_value=details),
-            patch("lib.emailbison.get_campaign_line_area_chart_stats",
-                  return_value=self._chart_stats()),
-            patch("lib.emailbison.get_campaign_stats", return_value={}),
+            patch("lib.emailbison.for_workspace",
+                  return_value=_mock_bison(details=details, chart=self._chart_stats())),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_campaign_daily_stats()
@@ -114,12 +133,11 @@ class TestPollCampaignDailyStats:
         sb = self._make_supabase(has_existing_rows=False)
         details = {"name": "New Camp", "status": "active", "created_at": "2026-01-15T00:00:00Z"}
 
-        chart_mock = MagicMock(return_value={"data": []})
+        client = _mock_bison(details=details, chart={"data": []})
+        chart_mock = client.get_campaign_line_area_chart_stats
         with (
             patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
-            patch("lib.emailbison.get_campaign_details", return_value=details),
-            patch("lib.emailbison.get_campaign_line_area_chart_stats", chart_mock),
-            patch("lib.emailbison.get_campaign_stats", return_value={}),
+            patch("lib.emailbison.for_workspace", return_value=client),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_campaign_daily_stats()
@@ -131,8 +149,8 @@ class TestPollCampaignDailyStats:
         sb = self._make_supabase()
         with (
             patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
-            patch("lib.emailbison.get_campaign_details",
-                  side_effect=Exception("API down")),
+            patch("lib.emailbison.for_workspace",
+                  return_value=_mock_bison(details_side_effect=Exception("API down"))),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_campaign_daily_stats()
@@ -145,11 +163,10 @@ class TestPollCampaignDailyStats:
 
         with (
             patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
-            patch("lib.emailbison.get_campaign_details", return_value=details),
-            patch("lib.emailbison.get_campaign_line_area_chart_stats",
-                  return_value=self._chart_stats()),
-            patch("lib.emailbison.get_campaign_stats",
-                  side_effect=Exception("stats unavailable")),
+            patch("lib.emailbison.for_workspace",
+                  return_value=_mock_bison(
+                      details=details, chart=self._chart_stats(),
+                      stats_side_effect=Exception("stats unavailable"))),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_campaign_daily_stats()

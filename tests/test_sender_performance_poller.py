@@ -12,6 +12,17 @@ from workers.sender_performance_poller import (
 _MODULE = "workers.sender_performance_poller"
 
 
+def _mock_bison(accounts=None, side_effect=None):
+    """Mock BisonClient — the poller resolves clients via for_workspace(),
+    so module-level function patches never intercept its calls."""
+    client = MagicMock()
+    if side_effect is not None:
+        client.get_campaign_email_accounts.side_effect = side_effect
+    else:
+        client.get_campaign_email_accounts.return_value = accounts or []
+    return client
+
+
 class TestSafeRate:
     def test_normal(self):
         assert _safe_rate(10, 200) == 5.0
@@ -92,7 +103,7 @@ class TestPollSenderEmailPerformance:
 
         with (
             patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1", "c2"]),
-            patch("lib.emailbison.get_campaign_email_accounts", return_value=[account]),
+            patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_sender_email_performance()
@@ -112,7 +123,7 @@ class TestPollSenderEmailPerformance:
 
         with (
             patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
-            patch("lib.emailbison.get_campaign_email_accounts", return_value=[account]),
+            patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_sender_email_performance()
@@ -130,7 +141,7 @@ class TestPollSenderEmailPerformance:
 
         with (
             patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
-            patch("lib.emailbison.get_campaign_email_accounts", return_value=[account]),
+            patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_sender_email_performance()
@@ -145,7 +156,7 @@ class TestPollSenderEmailPerformance:
 
         with (
             patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
-            patch("lib.emailbison.get_campaign_email_accounts", return_value=[account]),
+            patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_sender_email_performance()
@@ -173,7 +184,7 @@ class TestPollSenderEmailPerformance:
 
         with (
             patch(f"{_MODULE}.get_active_campaign_ids", return_value=["good", "bad"]),
-            patch("lib.emailbison.get_campaign_email_accounts", side_effect=side_effect),
+            patch("lib.emailbison.for_workspace", return_value=_mock_bison(side_effect=side_effect)),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_sender_email_performance()

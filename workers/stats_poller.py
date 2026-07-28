@@ -4,11 +4,15 @@ stats_poller.py — runs every 6 hours
 Fetches data from EmailBison and upserts into Supabase:
 - sender_daily_stats: per-sender email stats
 - workspace_daily_stats: workspace-wide chart data
+
+Loops over every configured workspace (lib.config.WORKSPACES), using that
+workspace's Bison token and stamping workspace_id on every row.
 """
 
 import logging
 from datetime import datetime, timedelta, timezone
 from lib import emailbison
+from lib.config import pollable_workspaces
 from lib.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -18,19 +22,20 @@ def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def poll_sender_stats() -> None:
+def poll_sender_stats(workspace_id: str, bison: emailbison.BisonClient) -> None:
     """Fetch all sender emails and batch-upsert today's stats into sender_daily_stats."""
     supabase = get_supabase()
     today = _today()
 
-    senders = emailbison.get_sender_emails()
-    logger.info(f"Polling stats for {len(senders)} senders")
+    senders = bison.get_sender_emails()
+    logger.info(f"[{workspace_id}] Polling stats for {len(senders)} senders")
 
     rows = []
     for sender in senders:
         email = sender.get("email", "")
         domain = email.split("@")[1] if "@" in email else ""
         rows.append({
+            "workspace_id": workspace_id,
             "sender_email_id": int(sender.get("id") or 0),
             "sender_email": email,
             "domain": domain,
@@ -49,17 +54,18 @@ def poll_sender_stats() -> None:
     if rows:
         try:
             supabase.table("sender_daily_stats").upsert(
-                rows, on_conflict="sender_email_id,stat_date"
+                rows, on_conflict="workspace_id,sender_email_id,stat_date"
             ).execute()
-            logger.info(f"Batch-upserted stats for {len(rows)} senders")
+            logger.info(f"[{workspace_id}] Batch-upserted stats for {len(rows)} senders")
         except Exception as e:
-            logger.error(f"Failed to batch-upsert sender stats: {e}")
+            logger.error(f"[{workspace_id}] Failed to batch-upsert sender stats: {e}")
 
 
-def poll_workspace_stats() -> None:
+def poll_workspace_stats(workspace_id: str, bison: emailbison.BisonClient) -> None:
     """
     Fetch workspace chart stats from EmailBison and batch-upsert into workspace_daily_stats.
-    One row per date with individual metric columns. Backfills the last 30 days on each run.
+    One row per (workspace, date) with individual metric columns. Backfills the
+    last 30 days on each run.
     """
     supabase = get_supabase()
     today = datetime.now(timezone.utc).date()
@@ -67,7 +73,7 @@ def poll_workspace_stats() -> None:
     start_date = (today - timedelta(days=30)).isoformat()
 
     try:
-        stats = emailbison.get_workspace_chart_stats(start_date, end_date)
+        stats = bison.get_workspace_chart_stats(start_date, end_date)
         series = stats.get("data", [])
 
         label_to_col = {
@@ -95,25 +101,32 @@ def poll_workspace_stats() -> None:
         if by_date:
             fetched_at = datetime.now(timezone.utc).isoformat()
             rows = [
-                {"stat_date": date_str, "fetched_at": fetched_at, **metrics}
+                {
+                    "workspace_id": workspace_id,
+                    "stat_date": date_str,
+                    "fetched_at": fetched_at,
+                    **metrics,
+                }
                 for date_str, metrics in by_date.items()
             ]
             supabase.table("workspace_daily_stats").upsert(
-                rows, on_conflict="stat_date"
+                rows, on_conflict="workspace_id,stat_date"
             ).execute()
-            logger.info(f"Batch-upserted workspace stats for {len(rows)} dates")
+            logger.info(f"[{workspace_id}] Batch-upserted workspace stats for {len(rows)} dates")
     except Exception as e:
-        logger.error(f"Failed to fetch/store workspace chart stats: {e}")
+        logger.error(f"[{workspace_id}] Failed to fetch/store workspace chart stats: {e}")
 
 
 def run() -> None:
     """Main entry point called by the scheduler."""
     logger.info("Starting stats poll")
-    for fn in [poll_sender_stats, poll_workspace_stats]:
-        try:
-            fn()
-        except Exception as e:
-            logger.error(f"stats_poller.{fn.__name__} failed: {e}")
+    for ws in pollable_workspaces():
+        bison = emailbison.for_workspace(ws["id"])
+        for fn in [poll_sender_stats, poll_workspace_stats]:
+            try:
+                fn(ws["id"], bison)
+            except Exception as e:
+                logger.error(f"stats_poller.{fn.__name__} failed for {ws['id']}: {e}")
     logger.info("Stats poll complete")
 
 

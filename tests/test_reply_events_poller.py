@@ -79,10 +79,12 @@ class TestPollReplyEvents:
         reply = self._make_reply()
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["camp1"]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["camp1"]),
             patch("lib.emailbison.get_campaign_replies",
                   side_effect=lambda cid, status: [reply] if status == "interested" else []),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
+            patch(f"{_MODULE}._existing_sent_map", return_value={}),
+            patch(f"{_MODULE}._campaigns_with_unresolved_sent", return_value=[]),
         ):
             poll_reply_events()
 
@@ -100,9 +102,11 @@ class TestPollReplyEvents:
         reply = self._make_reply("R1")
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["camp1"]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["camp1"]),
             patch("lib.emailbison.get_campaign_replies", return_value=[reply]),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
+            patch(f"{_MODULE}._existing_sent_map", return_value={}),
+            patch(f"{_MODULE}._campaigns_with_unresolved_sent", return_value=[]),
         ):
             poll_reply_events()
 
@@ -118,10 +122,12 @@ class TestPollReplyEvents:
             return [self._make_reply(f"R_{cid}")]
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1", "c2"]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["c1", "c2"]),
             patch("lib.emailbison.get_campaign_replies",
                   side_effect=lambda cid, s: make_reply_for(cid, s)),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
+            patch(f"{_MODULE}._existing_sent_map", return_value={}),
+            patch(f"{_MODULE}._campaigns_with_unresolved_sent", return_value=[]),
         ):
             poll_reply_events()
 
@@ -135,9 +141,11 @@ class TestPollReplyEvents:
         reply["id"] = None
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["c1"]),
             patch("lib.emailbison.get_campaign_replies", return_value=[reply]),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
+            patch(f"{_MODULE}._existing_sent_map", return_value={}),
+            patch(f"{_MODULE}._campaigns_with_unresolved_sent", return_value=[]),
         ):
             poll_reply_events()
 
@@ -152,10 +160,12 @@ class TestPollReplyEvents:
             return [self._make_reply(f"R_{status}")]
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["c1"]),
             patch("lib.emailbison.get_campaign_replies",
                   side_effect=raises_for_interested),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
+            patch(f"{_MODULE}._existing_sent_map", return_value={}),
+            patch(f"{_MODULE}._campaigns_with_unresolved_sent", return_value=[]),
         ):
             poll_reply_events()  # Should not raise
 
@@ -165,8 +175,10 @@ class TestPollReplyEvents:
     def test_no_campaigns_does_nothing(self):
         sb = self._make_supabase()
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=[]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=[]),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
+            patch(f"{_MODULE}._existing_sent_map", return_value={}),
+            patch(f"{_MODULE}._campaigns_with_unresolved_sent", return_value=[]),
         ):
             poll_reply_events()
 

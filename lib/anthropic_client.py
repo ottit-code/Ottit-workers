@@ -34,7 +34,9 @@ logger = logging.getLogger(__name__)
 _client = None
 _client_lock = threading.Lock()
 
-_MAX_TOKENS = 1024
+# Budget shared by adaptive thinking (on by default since Opus 5) and the
+# text answer — too low and the JSON draft gets truncated mid-thought.
+_MAX_TOKENS = 4096
 _PRIMARY_TEMP = 0.7
 _ENSEMBLE_TEMP = 0.4
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)

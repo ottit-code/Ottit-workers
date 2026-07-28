@@ -10,9 +10,15 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 def require_drafter_key(creds: HTTPAuthorizationCredentials = Security(_bearer)) -> None:
-    """Auth for the inbound webhook from n8n. Skipped if DRAFTER_API_KEY unset."""
+    """Auth for the inbound webhook from n8n.
+
+    Fail-closed: a missing DRAFTER_API_KEY only bypasses auth in development
+    (APP_ENV=development); otherwise it returns 503 so prod can't go open.
+    """
     if not config.DRAFTER_API_KEY:
-        return
+        if config.APP_ENV == "development":
+            return
+        raise HTTPException(status_code=503, detail="DRAFTER_API_KEY not configured")
     if creds is None or creds.credentials != config.DRAFTER_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing drafter API key")
 

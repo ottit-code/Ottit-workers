@@ -15,8 +15,9 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from lib import emailbison
+from lib.config import DEFAULT_WORKSPACE_ID, pollable_workspaces
 from lib.supabase_client import get_supabase
-from lib.utils import get_active_campaign_ids
+from lib.utils import get_active_campaign_ids, get_active_campaign_ids_from_bison
 
 logger = logging.getLogger(__name__)
 
@@ -97,23 +98,30 @@ def _parse_chart_stats(raw: dict | list) -> dict[str, dict]:
     return by_date
 
 
-def poll_campaign_daily_stats() -> None:
+def poll_campaign_daily_stats(
+    workspace_id: str = DEFAULT_WORKSPACE_ID,
+    bison: emailbison.BisonClient | None = None,
+) -> None:
     """Fetch daily stats for all active campaigns and upsert into campaign_daily_stats."""
     supabase = get_supabase()
     today = _today()
-    campaign_ids = get_active_campaign_ids(supabase)
-    logger.info(f"Polling daily stats for {len(campaign_ids)} campaigns")
+    bison = bison or emailbison.for_workspace(workspace_id)
+    if workspace_id == DEFAULT_WORKSPACE_ID:
+        campaign_ids = get_active_campaign_ids(supabase)
+    else:
+        campaign_ids = get_active_campaign_ids_from_bison(bison)
+    logger.info(f"[{workspace_id}] Polling daily stats for {len(campaign_ids)} campaigns")
 
     all_rows: list[dict] = []
 
     for campaign_id in campaign_ids:
         try:
             # Campaign details: name, status, settings (changes rarely — no local cache needed)
-            details = emailbison.get_campaign_details(campaign_id)
+            details = bison.get_campaign_details(campaign_id)
             start_date = _get_start_date(supabase, campaign_id, details)
 
             # Time-series chart stats
-            raw_stats = emailbison.get_campaign_line_area_chart_stats(
+            raw_stats = bison.get_campaign_line_area_chart_stats(
                 campaign_id, start_date, today
             )
             by_date = _parse_chart_stats(raw_stats)
@@ -129,6 +137,7 @@ def poll_campaign_daily_stats() -> None:
                 bounced = metrics.get("emails_bounced", 0)
 
                 all_rows.append({
+                    "workspace_id": workspace_id,
                     "campaign_id": str(campaign_id),
                     "campaign_name": details.get("name") or details.get("campaign_name"),
                     "campaign_status": details.get("status"),
@@ -161,9 +170,9 @@ def poll_campaign_daily_stats() -> None:
     if all_rows:
         try:
             supabase.table("campaign_daily_stats").upsert(
-                all_rows, on_conflict="campaign_id,stat_date"
+                all_rows, on_conflict="workspace_id,campaign_id,stat_date"
             ).execute()
-            logger.info(f"Batch-upserted {len(all_rows)} campaign daily stat rows")
+            logger.info(f"[{workspace_id}] Batch-upserted {len(all_rows)} campaign daily stat rows")
         except Exception as e:
             logger.error(f"Failed to batch-upsert campaign daily stats: {e}")
 
@@ -171,10 +180,18 @@ def poll_campaign_daily_stats() -> None:
 def run() -> None:
     """Main entry point called by the scheduler."""
     logger.info("Starting campaign daily stats poll")
-    try:
-        poll_campaign_daily_stats()
-    except Exception as e:
-        logger.error(f"campaign_daily_stats_poller.poll_campaign_daily_stats failed: {e}")
+    for ws in pollable_workspaces():
+        try:
+            bison = emailbison.for_workspace(ws["id"])
+        except Exception as e:
+            logger.error(f"Skipping workspace {ws['id']}: {e}")
+            continue
+        try:
+            poll_campaign_daily_stats(ws["id"], bison)
+        except Exception as e:
+            logger.error(
+                f"campaign_daily_stats_poller failed for workspace {ws['id']}: {e}"
+            )
     logger.info("Campaign daily stats poll complete")
 
 

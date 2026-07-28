@@ -39,8 +39,15 @@ def get_active_campaign_ids(supabase) -> list[str]:
         logger.warning(f"Documents table query failed ({e}); falling back to EmailBison API")
 
     # Fallback: query EmailBison campaigns endpoint directly
+    return get_active_campaign_ids_from_bison(emailbison)
+
+
+def get_active_campaign_ids_from_bison(bison) -> list[str]:
+    """Active campaign IDs straight from a Bison client (or the module-level
+    default). Used for non-default workspaces, whose campaigns are not in the
+    documents table."""
     try:
-        campaigns = emailbison.get_campaigns()
+        campaigns = bison.get_campaigns()
         return [
             str(c.get("id"))
             for c in campaigns

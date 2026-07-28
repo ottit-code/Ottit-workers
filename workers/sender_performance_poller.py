@@ -7,13 +7,15 @@ deliverability and recovery data from Supabase, and upserts into:
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
 from lib import emailbison
+from lib.config import DEFAULT_WORKSPACE_ID, pollable_workspaces
 from lib.supabase_client import get_supabase
-from lib.utils import get_active_campaign_ids
+from lib.supabase_paginate import fetch_all
+from lib.utils import get_active_campaign_ids, get_active_campaign_ids_from_bison
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +48,18 @@ def _fetch_sender_lookup_data(supabase, sender_ids: list[int]) -> dict[int, dict
         for sid in sender_ids
     }
 
-    # Latest warmup score per sender (order DESC, take first seen per sid)
+    # Latest warmup score per sender (order DESC, take first seen per sid).
+    # Bounded to the last 60 days and paged — an unbounded read truncates at
+    # the 1000-row cap and silently drops senders.
+    warmup_since = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
     try:
-        rows = (
-            supabase.table("sender_warmup_history")
+        rows = fetch_all(
+            lambda: supabase.table("sender_warmup_history")
             .select("sender_email_id,warmup_score")
             .in_("sender_email_id", sender_ids)
+            .gte("recorded_at", warmup_since)
             .order("recorded_at", desc=True)
-            .execute()
-            .data or []
+            .order("sender_email_id")
         )
         for row in rows:
             sid = row.get("sender_email_id")
@@ -87,15 +92,16 @@ def _fetch_sender_lookup_data(supabase, sender_ids: list[int]) -> dict[int, dict
     except Exception as e:
         logger.warning(f"Failed to fetch recovery data: {e}")
 
-    # Latest inbox placement score per sender
+    # Latest inbox placement score per sender (last 90 days, paged)
+    placement_since = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
     try:
-        rows = (
-            supabase.table("domain_placement_tests")
+        rows = fetch_all(
+            lambda: supabase.table("domain_placement_tests")
             .select("sender_email_id,overall_score")
             .in_("sender_email_id", sender_ids)
+            .gte("created_at", placement_since)
             .order("created_at", desc=True)
-            .execute()
-            .data or []
+            .order("sender_email_id")
         )
         for row in rows:
             sid = row.get("sender_email_id")
@@ -104,15 +110,14 @@ def _fetch_sender_lookup_data(supabase, sender_ids: list[int]) -> dict[int, dict
     except Exception as e:
         logger.warning(f"Failed to fetch placement scores: {e}")
 
-    # Latest spam filter score per sender
+    # Latest spam filter score per sender (paged)
     try:
-        rows = (
-            supabase.table("spam_filter_tests")
+        rows = fetch_all(
+            lambda: supabase.table("spam_filter_tests")
             .select("sender_email_id,score")
             .in_("sender_email_id", sender_ids)
             .order("created_at", desc=True)
-            .execute()
-            .data or []
+            .order("sender_email_id")
         )
         for row in rows:
             sid = row.get("sender_email_id")
@@ -146,18 +151,25 @@ def _compute_health_score(supabase, reply_rate: float, bounce_rate: float, db: d
     return None
 
 
-def poll_sender_email_performance() -> None:
+def poll_sender_email_performance(
+    workspace_id: str = DEFAULT_WORKSPACE_ID,
+    bison: emailbison.BisonClient | None = None,
+) -> None:
     """Fetch email accounts for all active campaigns, deduplicate, and upsert performance rows."""
     supabase = get_supabase()
     today = _today()
-    campaign_ids = get_active_campaign_ids(supabase)
-    logger.info(f"Polling sender performance across {len(campaign_ids)} campaigns")
+    bison = bison or emailbison.for_workspace(workspace_id)
+    if workspace_id == DEFAULT_WORKSPACE_ID:
+        campaign_ids = get_active_campaign_ids(supabase)
+    else:
+        campaign_ids = get_active_campaign_ids_from_bison(bison)
+    logger.info(f"[{workspace_id}] Polling sender performance across {len(campaign_ids)} campaigns")
 
     # Collect unique senders across all campaigns
     senders_by_id: dict[int, dict] = {}
     for campaign_id in campaign_ids:
         try:
-            accounts = emailbison.get_campaign_email_accounts(campaign_id)
+            accounts = bison.get_campaign_email_accounts(campaign_id)
             for account in accounts:
                 sid = account.get("id")
                 if sid is None:
@@ -201,6 +213,7 @@ def poll_sender_email_performance() -> None:
         bounce_rate = _safe_rate(bounced, emails_sent)
 
         rows.append({
+            "workspace_id": workspace_id,
             "sender_email_id": sid,
             "snapshot_date": today,
             "sender_email": email,
@@ -236,9 +249,9 @@ def poll_sender_email_performance() -> None:
     if rows:
         try:
             supabase.table("sender_email_performance").upsert(
-                rows, on_conflict="sender_email_id,snapshot_date"
+                rows, on_conflict="workspace_id,sender_email_id,snapshot_date"
             ).execute()
-            logger.info(f"Batch-upserted {len(rows)} sender performance rows")
+            logger.info(f"[{workspace_id}] Batch-upserted {len(rows)} sender performance rows")
         except Exception as e:
             logger.error(f"Failed to batch-upsert sender performance: {e}")
 
@@ -246,12 +259,18 @@ def poll_sender_email_performance() -> None:
 def run() -> None:
     """Main entry point called by the scheduler."""
     logger.info("Starting sender email performance poll")
-    try:
-        poll_sender_email_performance()
-    except Exception as e:
-        logger.error(
-            f"sender_performance_poller.poll_sender_email_performance failed: {e}"
-        )
+    for ws in pollable_workspaces():
+        try:
+            bison = emailbison.for_workspace(ws["id"])
+        except Exception as e:
+            logger.error(f"Skipping workspace {ws['id']}: {e}")
+            continue
+        try:
+            poll_sender_email_performance(ws["id"], bison)
+        except Exception as e:
+            logger.error(
+                f"sender_performance_poller failed for workspace {ws['id']}: {e}"
+            )
     logger.info("Sender email performance poll complete")
 
 

@@ -12,6 +12,8 @@ Runs all pollers on their schedules:
 - lead_engagement_poller:        daily at 2 AM
 - domain_blacklist_poller:       every 12 hours
 - dns_check_poller:              every 12 hours
+- placement_schedule_runner:     every 15 minutes
+- inboxassure_poller:            hourly (no-op until INBOXASSURE_API_TOKEN set)
 
 NOTE: The action API server must be run separately:
   uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -31,6 +33,8 @@ from workers import (
     sender_performance_poller,
     domain_blacklist_poller,
     dns_check_poller,
+    placement_schedule_runner,
+    inboxassure_poller,
 )
 
 logging.basicConfig(
@@ -54,6 +58,7 @@ def main():
     sender_performance_poller.run()
     domain_blacklist_poller.run()
     dns_check_poller.run()
+    inboxassure_poller.run()  # no-op until INBOXASSURE_API_TOKEN is set
     # lead_engagement_poller is intentionally skipped on startup — 48 k leads
     # is expensive; let the scheduled 2 AM run handle it.
 
@@ -81,6 +86,10 @@ def main():
                       id="domain_blacklist_poller", max_instances=1, coalesce=True)
     scheduler.add_job(dns_check_poller.run, "interval", hours=12,
                       id="dns_check_poller", max_instances=1, coalesce=True)
+    scheduler.add_job(placement_schedule_runner.run, "interval", minutes=15,
+                      id="placement_schedule_runner", max_instances=1, coalesce=True)
+    scheduler.add_job(inboxassure_poller.run, "interval", hours=1,
+                      id="inboxassure_poller", max_instances=1, coalesce=True)
 
     logger.info("Scheduler started")
     try:

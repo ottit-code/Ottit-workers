@@ -9,6 +9,7 @@ Pulls EmailGuard deliverability data into Supabase:
 
 import logging
 from lib import emailguard
+from lib.config import eg_pollable_workspaces
 from lib.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -21,11 +22,12 @@ def _domain_from_email(email: str) -> str:
     return ""
 
 
-def poll_placement_tests() -> None:
+def poll_placement_tests(workspace_id: str = "ws_v1", guard=None) -> None:
     """Batch-upsert inbox placement tests; for completed tests, batch-write per-email child rows."""
     supabase = get_supabase()
-    tests = emailguard.get_inbox_placement_tests()
-    logger.info(f"Polling {len(tests)} placement tests")
+    guard = guard or emailguard
+    tests = guard.get_inbox_placement_tests()
+    logger.info(f"[{workspace_id}] Polling {len(tests)} placement tests")
 
     parent_rows = []
     for test in tests:
@@ -33,6 +35,7 @@ def poll_placement_tests() -> None:
         if not uuid:
             continue
         parent_rows.append({
+            "workspace_id": workspace_id,
             "eg_test_uuid": str(uuid),
             "domain": test.get("domain") or _domain_from_email(test.get("sender_email") or ""),
             "sender_email_id": int(test.get("sender_email_id", 0)),
@@ -92,7 +95,7 @@ def poll_placement_tests() -> None:
             continue
 
         try:
-            full_test = emailguard.get_inbox_placement_test(uuid)
+            full_test = guard.get_inbox_placement_test(uuid)
             emails = full_test.get("inbox_placement_test_emails") or []
             for email_item in emails:
                 eg_email_uuid = str(email_item.get("uuid") or email_item.get("id", ""))
@@ -120,11 +123,12 @@ def poll_placement_tests() -> None:
             logger.error(f"Failed to batch-upsert placement test emails: {e}")
 
 
-def poll_spam_filter_tests() -> None:
+def poll_spam_filter_tests(workspace_id: str = "ws_v1", guard=None) -> None:
     """Batch-upsert spam filter tests into spam_filter_tests."""
     supabase = get_supabase()
-    tests = emailguard.get_spam_filter_tests()
-    logger.info(f"Polling {len(tests)} spam filter tests")
+    guard = guard or emailguard
+    tests = guard.get_spam_filter_tests()
+    logger.info(f"[{workspace_id}] Polling {len(tests)} spam filter tests")
 
     rows = []
     for test in tests:
@@ -156,11 +160,12 @@ def poll_spam_filter_tests() -> None:
             logger.error(f"Failed to batch-upsert spam filter tests: {e}")
 
 
-def poll_surbl_checks() -> None:
+def poll_surbl_checks(workspace_id: str = "ws_v1", guard=None) -> None:
     """Batch-upsert SURBL blacklist check results into surbl_checks."""
     supabase = get_supabase()
-    checks = emailguard.get_surbl_checks()
-    logger.info(f"Polling {len(checks)} SURBL checks")
+    guard = guard or emailguard
+    checks = guard.get_surbl_checks()
+    logger.info(f"[{workspace_id}] Polling {len(checks)} SURBL checks")
 
     rows = []
     for check in checks:
@@ -194,11 +199,17 @@ def poll_surbl_checks() -> None:
 def run() -> None:
     """Main entry point called by the scheduler."""
     logger.info("Starting delivery poll")
-    for fn in [poll_placement_tests, poll_spam_filter_tests, poll_surbl_checks]:
+    for ws in eg_pollable_workspaces():
         try:
-            fn()
+            guard = emailguard.for_workspace(ws["id"])
         except Exception as e:
-            logger.error(f"delivery_poller.{fn.__name__} failed: {e}")
+            logger.error(f"Skipping workspace {ws['id']}: {e}")
+            continue
+        for fn in [poll_placement_tests, poll_spam_filter_tests, poll_surbl_checks]:
+            try:
+                fn(ws["id"], guard)
+            except Exception as e:
+                logger.error(f"[{ws['id']}] delivery_poller.{fn.__name__} failed: {e}")
     logger.info("Delivery poll complete")
 
 

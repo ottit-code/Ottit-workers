@@ -9,22 +9,22 @@ Pulls EmailGuard domain blacklist check results into Supabase:
 import logging
 from datetime import datetime, timezone
 from lib import emailguard
+from lib.config import eg_pollable_workspaces
 from lib.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
 
-def run() -> None:
-    logger.info("Starting domain blacklist poll")
+def poll_workspace(workspace_id: str, guard) -> None:
     supabase = get_supabase()
 
     try:
-        checks = emailguard.get_domain_blacklist_checks()
+        checks = guard.get_domain_blacklist_checks()
     except Exception as e:
-        logger.error(f"Failed to fetch domain blacklist checks: {e}")
+        logger.error(f"[{workspace_id}] Failed to fetch domain blacklist checks: {e}")
         return
 
-    logger.info(f"Fetched {len(checks)} domain blacklist checks")
+    logger.info(f"[{workspace_id}] Fetched {len(checks)} domain blacklist checks")
 
     rows = []
     for check in checks:
@@ -58,6 +58,18 @@ def run() -> None:
         )
     except Exception as e:
         logger.error(f"Failed to upsert domain blacklist checks: {e}")
+
+
+def run() -> None:
+    logger.info("Starting domain blacklist poll")
+    for ws in eg_pollable_workspaces():
+        try:
+            guard = emailguard.for_workspace(ws["id"])
+        except Exception as e:
+            logger.error(f"Skipping workspace {ws['id']}: {e}")
+            continue
+        poll_workspace(ws["id"], guard)
+    logger.info("Domain blacklist poll complete")
 
 
 if __name__ == "__main__":

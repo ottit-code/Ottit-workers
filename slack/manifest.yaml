@@ -1,0 +1,62 @@
+# =============================================================================
+# Slack app manifest — "Saman Drafter Tester"
+#
+# Purpose: a tiny Slack app that lets you paste a prospect's email body into
+# Slack (DM or @mention) and get back a drafted Saman-voice reply.
+#
+# Wiring (handled outside this repo, in n8n):
+#
+#   Slack event  ──────────────►  n8n workflow  ──────────────►  Ottit Drafter API
+#   (DM or @mention)              extracts text from              POST /admin/draft-test
+#                                 the Slack payload,              (admin bearer)
+#                                 calls the API, then
+#                                 posts the response back
+#                                 to the same channel/DM
+#                                 using slack.text + slack.blocks
+#                                 from the API response.
+#
+# Replace YOUR_N8N_URL below with the actual n8n webhook URL once the
+# workflow is created. Slack will refuse to install the app until the
+# request_url responds 200 to its url_verification challenge.
+# =============================================================================
+
+display_information:
+  name: Saman Drafter Tester
+  description: Paste a prospect email body; get back a Saman-voice draft.
+  background_color: "#1F2937"
+
+features:
+  bot_user:
+    display_name: Saman Drafter
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      # post the drafted reply back into the conversation
+      - chat:write
+      # receive @mentions in channels the bot is added to
+      - app_mentions:read
+      # receive direct messages sent to the bot
+      - im:history
+      - im:read
+      - im:write
+
+settings:
+  event_subscriptions:
+    request_url: https://YOUR_N8N_URL/webhook/slack-drafter-tester
+    bot_events:
+      # someone @mentions the bot in a channel
+      - app_mention
+      # someone sends a DM to the bot
+      - message.im
+
+  # Enabled so you can later attach buttons to the drafted reply
+  # (approve / regenerate / send) without recreating the app.
+  interactivity:
+    is_enabled: true
+    request_url: https://YOUR_N8N_URL/webhook/slack-drafter-tester-interactivity
+
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
