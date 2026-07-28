@@ -55,12 +55,69 @@ def _load_todays_notifications() -> set:
         return set()
 
 
-def check_bounce_rate_spike(sender_rows: list, notified: set) -> None:
-    """Alert if any sender has bounce rate > 5% today."""
+def _prior_cumulative_map(supabase, today: str) -> dict:
+    """Latest cumulative snapshot per (workspace, sender) before today.
+
+    sender_daily_stats stores Bison's *lifetime* counters per snapshot day, so
+    "today's" activity is the delta from the most recent prior snapshot.
+    Bounded to the last 7 days (snapshots land at least daily).
+    """
+    since = (
+        datetime.now(timezone.utc) - timedelta(days=7)
+    ).date().isoformat()
+    rows = fetch_all(
+        lambda: supabase.table("sender_daily_stats")
+        .select("workspace_id,sender_email_id,stat_date,emails_sent,emails_bounced")
+        .gte("stat_date", since)
+        .lt("stat_date", today)
+        .order("stat_date", desc=True)
+        .order("sender_email_id")
+    )
+    prior: dict = {}
+    for r in rows:
+        key = (r.get("workspace_id"), r.get("sender_email_id"))
+        if key not in prior:  # rows are newest-first
+            prior[key] = r
+    return prior
+
+
+def _with_daily_deltas(sender_rows: list, prior: dict) -> list:
+    """Attach sent_today / bounced_today deltas to each of today's rows.
+
+    Senders without a prior snapshot get None deltas — their cumulative
+    counters can't be attributed to today, so delta-based checks skip them.
+    """
+    out = []
     for row in sender_rows:
-        sent = row.get("emails_sent", 0) or 0
-        bounced = row.get("emails_bounced", 0) or 0
-        if sent > 0 and bounced / sent > 0.05:
+        key = (row.get("workspace_id"), row.get("sender_email_id"))
+        prev = prior.get(key)
+        row = dict(row)
+        if prev is None:
+            row["sent_today"] = None
+            row["bounced_today"] = None
+        else:
+            row["sent_today"] = max(
+                (row.get("emails_sent") or 0) - (prev.get("emails_sent") or 0), 0
+            )
+            row["bounced_today"] = max(
+                (row.get("emails_bounced") or 0) - (prev.get("emails_bounced") or 0), 0
+            )
+        out.append(row)
+    return out
+
+
+def check_bounce_rate_spike(sender_rows: list, notified: set) -> None:
+    """Alert if any sender's bounce rate *today* exceeds 5%.
+
+    Uses daily deltas — the raw counters are cumulative lifetime values.
+    Requires a minimum of 20 sends today to avoid noise on tiny volumes.
+    """
+    for row in sender_rows:
+        sent = row.get("sent_today")
+        bounced = row.get("bounced_today")
+        if sent is None or bounced is None:
+            continue
+        if sent >= 20 and bounced / sent > 0.05:
             entity_id = str(row["sender_email_id"])
             if ("bounce_spike", entity_id) not in notified:
                 pct = f"{(bounced / sent * 100):.1f}%"
@@ -76,10 +133,13 @@ def check_bounce_rate_spike(sender_rows: list, notified: set) -> None:
 
 
 def check_daily_limit_approaching(sender_rows: list, notified: set) -> None:
-    """Alert if sender is at 90%+ of daily limit."""
+    """Alert if sender used 90%+ of its daily limit *today* (delta-based —
+    the raw emails_sent counter is cumulative lifetime, not per-day)."""
     for row in sender_rows:
         limit = row.get("daily_limit", 0) or 0
-        sent = row.get("emails_sent", 0) or 0
+        sent = row.get("sent_today")
+        if sent is None:
+            continue
         if limit > 0 and sent / limit >= 0.9:
             entity_id = str(row["sender_email_id"])
             if ("daily_limit_approaching", entity_id) not in notified:
@@ -142,14 +202,17 @@ def check_bundle_bounce_spike(sender_rows: list, notified: set) -> None:
     if not tags_map:
         return
 
-    # Aggregate today's sends/bounces per (workspace, tag).
+    # Aggregate today's sends/bounces per (workspace, tag) — daily deltas,
+    # not the raw cumulative counters.
     agg: dict[tuple, dict] = {}
     for row in sender_rows:
+        if row.get("sent_today") is None:
+            continue
         key = (row.get("workspace_id"), str(row.get("sender_email_id")))
         for tag in tags_map.get(key, []):
             bucket = agg.setdefault((row.get("workspace_id"), tag), {"sent": 0, "bounced": 0})
-            bucket["sent"] += row.get("emails_sent", 0) or 0
-            bucket["bounced"] += row.get("emails_bounced", 0) or 0
+            bucket["sent"] += row.get("sent_today") or 0
+            bucket["bounced"] += row.get("bounced_today") or 0
 
     for (workspace_id, tag), bucket in agg.items():
         sent, bounced = bucket["sent"], bucket["bounced"]
@@ -174,21 +237,37 @@ def check_bundle_bounce_spike(sender_rows: list, notified: set) -> None:
 
 
 def _daily_sent_by_date(workspace_id: str, start: str, end: str) -> dict[str, int]:
-    """stat_date → total emails_sent for a workspace (from sender_daily_stats)."""
+    """stat_date → emails actually sent that day for a workspace.
+
+    sender_daily_stats stores cumulative lifetime counters per snapshot, so
+    the per-day figure is each sender's delta from its previous snapshot.
+    Fetches a few extra days before `start` to seed the first deltas.
+    """
+    seed_start = (
+        datetime.fromisoformat(start).date() - timedelta(days=7)
+    ).isoformat()
     rows = fetch_all(
         lambda: get_supabase()
         .table("sender_daily_stats")
-        .select("stat_date,emails_sent")
+        .select("sender_email_id,stat_date,emails_sent")
         .eq("workspace_id", workspace_id)
-        .gte("stat_date", start)
+        .gte("stat_date", seed_start)
         .lte("stat_date", end)
-        .order("stat_date")
         .order("sender_email_id")
+        .order("stat_date")
     )
     sent: dict[str, int] = {}
-    for row in rows:
+    prev_by_sender: dict = {}
+    for row in rows:  # ordered by sender, then date
+        sid = row.get("sender_email_id")
         d = str(row.get("stat_date"))
-        sent[d] = sent.get(d, 0) + (row.get("emails_sent", 0) or 0)
+        cum = row.get("emails_sent", 0) or 0
+        prev = prev_by_sender.get(sid)
+        prev_by_sender[sid] = cum
+        if prev is None or d < start:
+            continue  # no baseline yet, or still in the seed window
+        delta = max(cum - prev, 0)
+        sent[d] = sent.get(d, 0) + delta
     return sent
 
 
@@ -321,15 +400,18 @@ def run() -> None:
     """Main entry point called by the scheduler."""
     logger.info("Running notifier checks")
 
-    # Load sender stats once — shared across both sender checks
+    # Load sender stats once — shared across both sender checks. Counters are
+    # cumulative lifetime values, so attach per-day deltas before checking.
     supabase = get_supabase()
     try:
-        sender_rows = fetch_all(
+        today = _today()
+        raw_rows = fetch_all(
             lambda: supabase.table("sender_daily_stats")
             .select("workspace_id,sender_email_id,sender_email,emails_sent,emails_bounced,daily_limit")
-            .eq("stat_date", _today())
+            .eq("stat_date", today)
             .order("sender_email_id")
         )
+        sender_rows = _with_daily_deltas(raw_rows, _prior_cumulative_map(supabase, today))
     except Exception as e:
         logger.error(f"notifier: failed to load sender_daily_stats: {e}")
         sender_rows = []
