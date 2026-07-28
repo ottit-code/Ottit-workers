@@ -30,7 +30,78 @@ def _safe_rate(numerator: int | float, denominator: int | float) -> float:
     return round((numerator / denominator) * 100, 4)
 
 
-def _fetch_sender_lookup_data(supabase, sender_ids: list[int]) -> dict[int, dict]:
+def _int_score(value) -> int | None:
+    """Bison reports warmup_score as a float (e.g. 96.9); our columns are int."""
+    if value is None:
+        return None
+    try:
+        return round(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_live_warmup(bison: emailbison.BisonClient) -> dict[int, dict]:
+    """Live warmup data per sender id from Bison's /api/warmup/sender-emails."""
+    try:
+        out: dict[int, dict] = {}
+        for row in bison.get_warmup_sender_emails():
+            if row.get("id") is None:
+                continue
+            row = dict(row)
+            row["warmup_score"] = _int_score(row.get("warmup_score"))
+            out[int(row["id"])] = row
+        return out
+    except Exception as e:
+        logger.warning(f"Failed to fetch live warmup data from Bison: {e}")
+        return {}
+
+
+def _record_warmup_history(supabase, warmup_by_id: dict[int, dict]) -> None:
+    """Append today's warmup snapshot per sender (skips senders already
+    recorded today so deep-refresh reruns don't duplicate rows)."""
+    if not warmup_by_id:
+        return
+    today_start = datetime.now(timezone.utc).date().isoformat()
+    try:
+        existing = fetch_all(
+            lambda: supabase.table("sender_warmup_history")
+            .select("sender_email_id")
+            .gte("recorded_at", today_start)
+            .order("id")
+        )
+        already = {r["sender_email_id"] for r in existing}
+    except Exception as e:
+        logger.warning(f"Failed to read today's warmup history: {e}")
+        already = set()
+
+    recorded_at = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for sid, w in warmup_by_id.items():
+        if sid in already:
+            continue
+        email = w.get("email") or ""
+        rows.append({
+            "sender_email_id": sid,
+            "sender_email": email,
+            "domain": w.get("domain") or (email.split("@")[1] if "@" in email else ""),
+            "provider": "emailbison",
+            "warmup_score": w.get("warmup_score"),
+            "recorded_at": recorded_at,
+        })
+    if not rows:
+        return
+    try:
+        supabase.table("sender_warmup_history").insert(rows).execute()
+        logger.info(f"Recorded {len(rows)} warmup history snapshots")
+    except Exception as e:
+        logger.error(f"Failed to insert warmup history: {e}")
+
+
+def _fetch_sender_lookup_data(
+    supabase,
+    sender_ids: list[int],
+    live_warmup: dict[int, dict] | None = None,
+) -> dict[int, dict]:
     """Batch-fetch warmup scores, recovery status, and deliverability for all senders."""
     if not sender_ids:
         return {}
@@ -48,25 +119,32 @@ def _fetch_sender_lookup_data(supabase, sender_ids: list[int]) -> dict[int, dict
         for sid in sender_ids
     }
 
-    # Latest warmup score per sender (order DESC, take first seen per sid).
-    # Bounded to the last 60 days and paged — an unbounded read truncates at
-    # the 1000-row cap and silently drops senders.
-    warmup_since = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
-    try:
-        rows = fetch_all(
-            lambda: supabase.table("sender_warmup_history")
-            .select("sender_email_id,warmup_score")
-            .in_("sender_email_id", sender_ids)
-            .gte("recorded_at", warmup_since)
-            .order("recorded_at", desc=True)
-            .order("sender_email_id")
-        )
-        for row in rows:
-            sid = row.get("sender_email_id")
-            if sid in lookup and lookup[sid]["warmup_score"] is None:
-                lookup[sid]["warmup_score"] = row.get("warmup_score")
-    except Exception as e:
-        logger.warning(f"Failed to fetch warmup scores: {e}")
+    # Warmup score: prefer live Bison data, fall back to recorded history.
+    for sid, w in (live_warmup or {}).items():
+        if sid in lookup:
+            lookup[sid]["warmup_score"] = w.get("warmup_score")
+
+    missing_warmup = [sid for sid in sender_ids if lookup[sid]["warmup_score"] is None]
+    if missing_warmup:
+        # Latest recorded score per sender (order DESC, take first seen).
+        # Bounded to the last 60 days and paged — an unbounded read truncates
+        # at the 1000-row cap and silently drops senders.
+        warmup_since = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        try:
+            rows = fetch_all(
+                lambda: supabase.table("sender_warmup_history")
+                .select("sender_email_id,warmup_score")
+                .in_("sender_email_id", missing_warmup)
+                .gte("recorded_at", warmup_since)
+                .order("recorded_at", desc=True)
+                .order("sender_email_id")
+            )
+            for row in rows:
+                sid = row.get("sender_email_id")
+                if sid in lookup and lookup[sid]["warmup_score"] is None:
+                    lookup[sid]["warmup_score"] = row.get("warmup_score")
+        except Exception as e:
+            logger.warning(f"Failed to fetch warmup scores: {e}")
 
     # Active (incomplete) recovery policies
     try:
@@ -159,10 +237,11 @@ def poll_sender_email_performance(
     supabase = get_supabase()
     today = _today()
     bison = bison or emailbison.for_workspace(workspace_id)
-    if workspace_id == DEFAULT_WORKSPACE_ID:
+    # Always use the live Bison campaign list — the Supabase document copy
+    # goes stale and yields 404s for deleted campaigns (and misses new ones).
+    campaign_ids = get_active_campaign_ids_from_bison(bison)
+    if not campaign_ids and workspace_id == DEFAULT_WORKSPACE_ID:
         campaign_ids = get_active_campaign_ids(supabase)
-    else:
-        campaign_ids = get_active_campaign_ids_from_bison(bison)
     logger.info(f"[{workspace_id}] Polling sender performance across {len(campaign_ids)} campaigns")
 
     # Collect unique senders across all campaigns
@@ -192,7 +271,9 @@ def poll_sender_email_performance(
     sender_ids = list(senders_by_id.keys())
     logger.info(f"Computing performance for {len(sender_ids)} unique senders")
 
-    lookup = _fetch_sender_lookup_data(supabase, sender_ids)
+    live_warmup = _fetch_live_warmup(bison)
+    _record_warmup_history(supabase, live_warmup)
+    lookup = _fetch_sender_lookup_data(supabase, sender_ids, live_warmup)
 
     fetched_at = datetime.now(timezone.utc).isoformat()
     rows: list[dict] = []

@@ -1,8 +1,11 @@
-"""Daily Review — today's planned sending schedule from EmailBison.
+"""Daily Review — today's sending schedule from EmailBison.
 
-GET /schedule/today aggregates the scheduled (not yet sent) emails for every
-active campaign into planned counts per campaign and per inbox, filtered to
-the current UTC day. Read-only: never mutates anything on the Bison side.
+GET /schedule/today reports three numbers for the current UTC day:
+- planned:   full day's plan, captured at UTC midnight by send_plan_snapshotter
+- sent:      emails actually sent so far today (live Bison workspace stats)
+- remaining: what's still queued in Bison's scheduled-emails right now
+
+Read-only: never mutates anything on the Bison side.
 
 Results are cached in-process for ~10 minutes; the manual data refresh
 (POST /actions/refresh) clears the cache so the next request re-fetches.
@@ -10,138 +13,49 @@ Results are cached in-process for ~10 minutes; the manual data refresh
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Security
 
-from lib import config, emailbison
+from lib import config, send_schedule
+from lib.supabase_client import get_supabase
 from api.deps import require_api_key, _cache_get_stale, _cache_set, _cache_revalidate
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _SCHEDULE_CACHE_TTL = 600  # seconds
-_MAX_PAGES = 30            # safety cap per campaign
-_ACTIVE_STATUSES = {"active", "running"}
 
 
-def _fetch_scheduled_emails(client, campaign_id: str) -> List[dict]:
-    """All scheduled emails for a campaign, following Laravel-style pagination."""
-    rows: List[dict] = []
-    page = 1
-    while page <= _MAX_PAGES:
-        res = client.get(
-            f"/api/campaigns/{campaign_id}/scheduled-emails",
-            params={"page": page},
-        )
-        if isinstance(res, list):
-            rows.extend(res)
-            break
-        if not isinstance(res, dict):
-            break
-        batch = res.get("data") or []
-        if not isinstance(batch, list):
-            break
-        rows.extend(batch)
-        meta = res.get("meta") or {}
-        last_page = meta.get("last_page")
-        current = meta.get("current_page", page)
-        if not last_page or int(current) >= int(last_page):
-            break
-        page = int(current) + 1
-    return rows
-
-
-def _scheduled_day_utc(item: dict) -> Optional[str]:
-    """UTC calendar date ("YYYY-MM-DD") an item is scheduled for, if parseable."""
-    raw = None
-    for field in ("scheduled_at", "send_at", "send_time", "scheduled_datetime",
-                  "scheduled_date", "scheduled_for", "created_at"):
-        raw = item.get(field)
-        if raw:
-            break
-    if not raw:
-        return None
-    text = str(raw).strip()
+def _plan_snapshot(today: str, ws_ids: List[str]) -> Dict[str, List[dict]]:
+    """Midnight plan snapshot rows grouped by workspace_id."""
     try:
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).date().isoformat()
-    except ValueError:
-        # Fall back to a bare leading date ("YYYY-MM-DD ...").
-        return text[:10] if len(text) >= 10 and text[4:5] == "-" else None
-
-
-def _inbox_email(item: dict) -> str:
-    """Sender inbox address for a scheduled email, tolerant of payload shapes."""
-    for field in ("sender_email", "email_account", "sender", "from"):
-        val = item.get(field)
-        if isinstance(val, dict):
-            email = val.get("email") or val.get("email_address")
-            if email:
-                return str(email)
-        elif isinstance(val, str) and "@" in val:
-            return val
-    for field in ("from_email", "sender_email_address"):
-        val = item.get(field)
-        if isinstance(val, str) and "@" in val:
-            return val
-    return "unknown"
-
-
-def _plan_for_workspace(ws: dict, today: str) -> List[Dict[str, Any]]:
-    """Planned sends today per active campaign (with per-inbox breakdown)."""
-    client = emailbison.for_workspace(ws["id"])
-    campaigns = client.get_campaigns()
-    active = [
-        c for c in campaigns
-        if str(c.get("status") or "").lower() in _ACTIVE_STATUSES
-    ]
-
-    def one(c: dict) -> Dict[str, Any]:
-        cid = str(c.get("id"))
-        entry: Dict[str, Any] = {
-            "workspace_id": ws["id"],
-            "workspace_name": ws["name"],
-            "campaign_id": cid,
-            "campaign_name": c.get("name", ""),
-            "planned_today": 0,
-            "inboxes": [],
-            "error": None,
-        }
-        try:
-            items = _fetch_scheduled_emails(client, cid)
-        except Exception as e:
-            logger.warning(f"scheduled-emails fetch failed for campaign {cid}: {e}")
-            entry["error"] = "fetch_failed"
-            return entry
-        per_inbox: Dict[str, int] = {}
-        for item in items:
-            if _scheduled_day_utc(item) != today:
-                continue
-            entry["planned_today"] += 1
-            inbox = _inbox_email(item)
-            per_inbox[inbox] = per_inbox.get(inbox, 0) + 1
-        entry["inboxes"] = [
-            {"email": email, "planned": count}
-            for email, count in sorted(per_inbox.items(), key=lambda kv: -kv[1])
-        ]
-        return entry
-
-    if not active:
-        return []
-    with ThreadPoolExecutor(max_workers=min(8, len(active))) as pool:
-        return list(pool.map(one, active))
+        rows = (
+            get_supabase()
+            .table("daily_send_plan")
+            .select("workspace_id,campaign_id,campaign_name,planned,inboxes")
+            .eq("plan_date", today)
+            .in_("workspace_id", ws_ids)
+            .execute()
+            .data or []
+        )
+        grouped: Dict[str, List[dict]] = {}
+        for r in rows:
+            grouped.setdefault(r["workspace_id"], []).append(r)
+        return grouped
+    except Exception as e:
+        logger.warning(f"daily_send_plan read failed: {e}")
+        return {}
 
 
 @router.get("/schedule/today", dependencies=[Security(require_api_key)])
 def schedule_today(workspace_id: Optional[str] = None):
-    """Today's planned sending volume (UTC day) per campaign and per inbox.
+    """Today's sending schedule (UTC day) per campaign and per inbox.
 
-    Aggregated from EmailBison scheduled emails for active campaigns.
+    planned_total/planned_today reflect the *current* Bison queue (remaining).
+    plan_total is the midnight snapshot of the full day's plan (null until the
+    first snapshot exists); sent_total is live sent-so-far from Bison.
     Cached ~10 minutes; the manual data refresh busts the cache.
     """
     today = datetime.now(timezone.utc).date().isoformat()
@@ -155,18 +69,46 @@ def schedule_today(workspace_id: Optional[str] = None):
             [w for w in pollable if w["id"] == ws_filter]
             if ws_filter else pollable
         )
+        snapshot = _plan_snapshot(today, [w["id"] for w in workspaces])
+
         campaigns: List[Dict[str, Any]] = []
+        sent_total: Optional[int] = None
+        plan_total: Optional[int] = None
         for ws in workspaces:
+            snap_rows = snapshot.get(ws["id"]) or []
             try:
-                campaigns.extend(_plan_for_workspace(ws, today))
+                if snap_rows:
+                    # Fast path: remaining derived from the midnight plan and
+                    # per-campaign sent-today (seconds, not minutes).
+                    campaigns.extend(
+                        send_schedule.plan_from_snapshot(ws, today, snap_rows)
+                    )
+                    plan_total = (plan_total or 0) + sum(
+                        int(r.get("planned") or 0) for r in snap_rows
+                    )
+                else:
+                    # No snapshot yet: page the live queue (slow but exact).
+                    slow = send_schedule.plan_for_workspace(ws, today)
+                    for c in slow:
+                        c["planned_start"] = None
+                        c["sent_today"] = None
+                    campaigns.extend(slow)
             except Exception as e:
                 logger.warning(f"schedule fetch failed for workspace {ws['id']}: {e}")
+            ws_sent = send_schedule.sent_today_for_workspace(ws["id"], today)
+            if ws_sent is not None:
+                sent_total = (sent_total or 0) + ws_sent
 
         campaigns.sort(key=lambda c: -c["planned_today"])
+        remaining_total = sum(c["planned_today"] for c in campaigns)
         return {
             "date": today,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "planned_total": sum(c["planned_today"] for c in campaigns),
+            # Back-compat: planned_total has always been the live queue.
+            "planned_total": remaining_total,
+            "remaining_total": remaining_total,
+            "plan_total": plan_total,
+            "sent_total": sent_total,
             "campaigns": campaigns,
         }
 

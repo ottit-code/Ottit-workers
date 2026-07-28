@@ -14,6 +14,7 @@ Runs all pollers on their schedules:
 - dns_check_poller:              every 12 hours
 - placement_schedule_runner:     every 15 minutes
 - inboxassure_poller:            hourly (no-op until INBOXASSURE_API_TOKEN set)
+- send_plan_snapshotter:         daily at 00:05 UTC (captures the day's plan)
 
 NOTE: The action API server must be run separately:
   uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -35,6 +36,7 @@ from workers import (
     dns_check_poller,
     placement_schedule_runner,
     inboxassure_poller,
+    send_plan_snapshotter,
 )
 
 logging.basicConfig(
@@ -90,6 +92,10 @@ def main():
                       id="placement_schedule_runner", max_instances=1, coalesce=True)
     scheduler.add_job(inboxassure_poller.run, "interval", hours=1,
                       id="inboxassure_poller", max_instances=1, coalesce=True)
+    # Right after UTC midnight, before sending drains the queue. Not run on
+    # startup: a mid-day capture would record an already-drained plan.
+    scheduler.add_job(send_plan_snapshotter.run, "cron", hour=0, minute=5,
+                      id="send_plan_snapshotter", max_instances=1, coalesce=True)
 
     logger.info("Scheduler started")
     try:

@@ -130,6 +130,11 @@ class BisonClient:
     def get_campaign_email_accounts(self, campaign_id: str) -> list:
         return self.get_all(f"/api/campaigns/{campaign_id}/sender-emails")
 
+    def get_warmup_sender_emails(self) -> list:
+        """Live warmup stats per sender (score, daily limit, sent/replies/spam
+        saves). This is the only Bison source of warmup_score."""
+        return self.get_all("/api/warmup/sender-emails")
+
 
 # ---------------------------------------------------------------------------
 # Workspace-aware client registry
