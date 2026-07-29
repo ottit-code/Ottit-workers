@@ -14,10 +14,18 @@
 -- Also fixes cross-workspace collisions: sender counts dedupe on
 -- (workspace_id, sender_email_id), and the tag join carries workspace_id.
 --
--- Run in Supabase SQL editor (v1 schema) or via psql.
+-- Function names are schema-qualified: the `set search_path` clause only
+-- applies INSIDE function execution, not to where CREATE FUNCTION puts the
+-- function — an unqualified name in a session without v1 in its search_path
+-- silently creates a stray copy in public (which happened on first apply;
+-- fixed by 016b in the live DB).
 -- ============================================================
 
-create or replace function get_tld_daily_performance(
+-- Clean up stray public copies if a previous unqualified apply created them.
+drop function if exists public.get_tld_daily_performance(date, date, text);
+drop function if exists public.get_tag_daily_performance(date, date, text);
+
+create or replace function v1.get_tld_daily_performance(
     p_start date,
     p_end date,
     p_workspace_id text default null
@@ -73,7 +81,7 @@ as $$
     order by 1, 2;
 $$;
 
-create or replace function get_tag_daily_performance(
+create or replace function v1.get_tag_daily_performance(
     p_start date,
     p_end date,
     p_workspace_id text default null
