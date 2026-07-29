@@ -43,21 +43,41 @@ scheduler = BlockingScheduler()
 REFRESH_HOURS = "0,3,6,9,12,15,18,21"
 
 
-def main():
-    # Run immediately on startup
-    logger.info("Running initial poll on startup")
-    deep_refresh.run()
-    notifier.run()
-    ab_test_snapshots_poller.run()
-    domain_blacklist_poller.run()
-    dns_check_poller.run()
-    # lead_engagement_poller is intentionally skipped on startup — 48 k leads
-    # is expensive; let the scheduled 2 AM run handle it.
+def startup_poll():
+    """Initial data pull after (re)start, run sequentially in one job.
 
-    # Schedule recurring jobs — max_instances=1 + coalesce prevent stacked runs
-    # if a job takes longer than its interval.
+    Registered as a one-shot job rather than called before scheduler.start():
+    a blocking startup refresh can take 30+ minutes, and a deploy near
+    midnight would silently skip time-critical cron slots (this is how the
+    00:05 send_plan_snapshotter got missed on 2026-07-29).
+    lead_engagement_poller is intentionally excluded — 48k leads is
+    expensive; the scheduled 2 AM run handles it.
+    """
+    logger.info("Running initial poll on startup")
+    for fn in (
+        deep_refresh.run,
+        notifier.run,
+        ab_test_snapshots_poller.run,
+        domain_blacklist_poller.run,
+        dns_check_poller.run,
+    ):
+        try:
+            fn()
+        except Exception:
+            logger.exception(f"startup poll step failed: {fn.__module__}")
+
+
+def main():
+    # Register every cron/interval job BEFORE starting so no slot is missed
+    # while the startup poll runs. max_instances=1 + coalesce prevent stacked
+    # runs if a job takes longer than its interval.
+    # One-shot, fires as soon as the scheduler starts. misfire_grace_time=None
+    # = run no matter how late (its nominal run time is "now", i.e. slightly
+    # before start(), which the default 1s grace would treat as missed).
+    scheduler.add_job(startup_poll, id="startup_poll", misfire_grace_time=None)
     scheduler.add_job(deep_refresh.run, "cron", hour=REFRESH_HOURS, minute=0,
-                      id="deep_refresh", max_instances=1, coalesce=True)
+                      id="deep_refresh", max_instances=1, coalesce=True,
+                      misfire_grace_time=900)
     scheduler.add_job(notifier.run, "interval", minutes=15,
                       id="notifier", max_instances=1, coalesce=True)
     scheduler.add_job(ab_test_snapshots_poller.run, "interval", hours=6,
@@ -71,9 +91,12 @@ def main():
     scheduler.add_job(placement_schedule_runner.run, "interval", minutes=15,
                       id="placement_schedule_runner", max_instances=1, coalesce=True)
     # Right after UTC midnight, before sending drains the queue. Not run on
-    # startup: a mid-day capture would record an already-drained plan.
+    # startup: a mid-day capture would record an already-drained plan. The
+    # generous misfire grace lets a late scheduler still capture within the
+    # first hour, when the queue is essentially untouched.
     scheduler.add_job(send_plan_snapshotter.run, "cron", hour=0, minute=5,
-                      id="send_plan_snapshotter", max_instances=1, coalesce=True)
+                      id="send_plan_snapshotter", max_instances=1, coalesce=True,
+                      misfire_grace_time=3600)
 
     logger.info("Scheduler started")
     try:
