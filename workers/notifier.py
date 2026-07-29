@@ -170,7 +170,12 @@ def check_daily_limit_approaching(sender_rows: list, notified: set) -> None:
 
 def _normalize_tags(raw) -> list[str]:
     """sender_email_performance.tags is a Bison payload: list of strings or
-    list of {"name": ...} dicts. Return clean tag names."""
+    list of {"name": ...} dicts. Return clean tag names.
+
+    Bison mirrors each bundle tag with an internal "p."-prefixed copy
+    (p.CI-DED-Set4-0518, …) — excluded as a rule so bundles aren't
+    double-counted in alerts.
+    """
     if not raw:
         return []
     tags: list[str] = []
@@ -179,7 +184,7 @@ def _normalize_tags(raw) -> list[str]:
             tags.append(item.strip())
         elif isinstance(item, dict) and item.get("name"):
             tags.append(str(item["name"]).strip())
-    return tags
+    return [t for t in tags if "p." not in t]
 
 
 def _latest_tags_by_sender() -> dict[tuple, list[str]]:

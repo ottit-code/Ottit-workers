@@ -78,6 +78,21 @@ def _ws(workspace_id: Optional[str]) -> Optional[str]:
     return None
 
 
+def _strip_internal_tags(raw) -> list:
+    """Bison mirrors each bundle tag with an internal "p."-prefixed copy
+    (p.CI-DED-Set4-0518, …). Exclude any tag containing "p." as a rule.
+
+    Tags arrive either as plain strings or {"name": ...} dicts.
+    """
+    out: list = []
+    for item in raw or []:
+        name = item.get("name") if isinstance(item, dict) else item
+        if isinstance(name, str) and "p." in name:
+            continue
+        out.append(item)
+    return out
+
+
 def _latest_perf_map() -> dict[int, dict]:
     """Latest tags + warmup score per sender from sender_email_performance.
 
@@ -103,7 +118,7 @@ def _latest_perf_map() -> dict[int, dict]:
         if sid is None or int(sid) in out:
             continue
         out[int(sid)] = {
-            "tags": r.get("tags") or [],
+            "tags": _strip_internal_tags(r.get("tags")),
             "warmup_score": r.get("warmup_score"),
         }
     return out
@@ -364,6 +379,9 @@ def tag_performance(
         rows = fetch_all(lambda: get_supabase().rpc("get_tag_daily_performance", params))
     except Exception:
         raise
+    # Bison mirrors each bundle tag with an internal "p."-prefixed copy
+    # (p.CI-DED-Set4-0518, …) that duplicates the real tag — exclude them.
+    rows = [r for r in rows if "p." not in (r.get("tag") or "")]
     try:
         cohort = _cohort_reply_map(range_start, range_end, "tag", _ws(workspace_id))
         _merge_cohort_fields(rows, "tag", cohort)
