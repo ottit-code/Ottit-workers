@@ -254,6 +254,21 @@ def _build_senders(
     if start_date or end_date:
         range_start, range_end = _resolve_date_range(30, start_date, end_date)
         rows = _senders_for_range(range_start, range_end, domain, warmup_enabled, ws_filter)
+        # Range replies use cohort attribution (replies to emails SENT in the
+        # range, whenever they landed) — the dashboard's agreed definition.
+        # Snapshot deltas can't provide this: historical emails_replied
+        # snapshots were 0 until the 2026-07-29 poller fix, and deltas count
+        # replies by arrival date anyway.
+        try:
+            cohort = _cohort_reply_map(range_start, range_end, "sender", ws_filter)
+            per_sender: dict[str, int] = {}
+            for (email, _d), n in cohort.items():
+                per_sender[email] = per_sender.get(email, 0) + n
+            for row in rows:
+                email = (row.get("sender_email") or "").lower()
+                row["emails_replied"] = per_sender.get(email, 0)
+        except Exception as e:
+            logger.warning(f"cohort reply merge failed for /senders range: {e}")
         perf_map = _latest_perf_map()
         for row in rows:
             sid = row.get("sender_email_id")
@@ -364,33 +379,74 @@ def sender_history(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ):
-    """Time-series stats for a single sender.
+    """Per-day time-series stats for a single sender.
 
     Either pass `days` (last N days ending today) or an explicit `start_date` /
     `end_date` range (YYYY-MM-DD, inclusive). Explicit dates take precedence.
+
+    Bison counters are cumulative lifetime snapshots, so each day's value is
+    the delta from the previous snapshot (the first-ever snapshot reports 0 —
+    its true daily value is unknown). Replies instead come from reply_events
+    by arrival date, which is accurate per-day and unaffected by snapshot
+    history gaps.
     """
     supabase = get_supabase()
-    today = datetime.now(timezone.utc).date()
+    range_start, range_end = _resolve_date_range(days, start_date, end_date)
     try:
-        range_end = datetime.fromisoformat(end_date).date() if end_date else today
-        range_start = (
-            datetime.fromisoformat(start_date).date()
-            if start_date
-            else range_end - timedelta(days=days)
+        rows = fetch_all(
+            lambda: supabase.table("sender_daily_stats")
+            .select("*")
+            .eq("sender_email_id", sender_email_id)
+            .lte("stat_date", range_end)
+            .order("stat_date")
         )
-    except ValueError:
-        raise HTTPException(status_code=422, detail="Dates must be YYYY-MM-DD")
-    if range_start > range_end:
-        raise HTTPException(status_code=422, detail="start_date must be <= end_date")
-    try:
-        result = supabase.table("sender_daily_stats").select("*").eq(
-            "sender_email_id", sender_email_id
-        ).gte("stat_date", range_start.isoformat()).lte(
-            "stat_date", range_end.isoformat()
-        ).order("stat_date").execute()
-        if not result.data:
+        if not rows:
             raise HTTPException(status_code=404, detail="Sender not found or no data")
-        return result.data
+
+        # Bison sender ids collide across workspaces; keep the workspace with
+        # the freshest snapshot so deltas aren't computed across mixed fleets.
+        by_ws: dict = {}
+        for r in rows:
+            by_ws.setdefault(r.get("workspace_id"), []).append(r)
+        history = max(by_ws.values(), key=lambda h: h[-1]["stat_date"])
+
+        out: list[dict] = []
+        prev: Optional[dict] = None
+        for r in history:
+            d = dict(r)
+            for field in _DELTA_FIELDS:
+                base = (prev or {}).get(field) or 0
+                d[field] = max(0, (r.get(field) or 0) - base) if prev is not None else 0
+            prev = r
+            if range_start <= r["stat_date"] <= range_end:
+                out.append(d)
+        if not out:
+            raise HTTPException(status_code=404, detail="Sender not found or no data")
+
+        # Replies by arrival date (excludes automated replies).
+        try:
+            email = (history[-1].get("sender_email") or "").lower()
+            if email:
+                replies = fetch_all(
+                    lambda: supabase.table("reply_events")
+                    .select("reply_id,replied_at,classification")
+                    .eq("sender_email", email)
+                    .gte("replied_at", f"{range_start}T00:00:00Z")
+                    .lte("replied_at", f"{range_end}T23:59:59Z")
+                    .order("reply_id")
+                )
+                per_day: dict[str, int] = {}
+                for rep in replies:
+                    if rep.get("classification") == "automated_reply":
+                        continue
+                    day = str(rep.get("replied_at") or "")[:10]
+                    per_day[day] = per_day.get(day, 0) + 1
+                for d in out:
+                    d["emails_replied"] = per_day.get(str(d["stat_date"])[:10], 0)
+        except Exception as e:
+            logger.warning(f"reply_events merge failed for sender history: {e}")
+
+        return out
     except HTTPException:
         raise
     except Exception:

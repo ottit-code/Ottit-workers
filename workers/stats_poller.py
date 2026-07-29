@@ -23,29 +23,45 @@ def _today() -> str:
 
 
 def poll_sender_stats(workspace_id: str, bison: emailbison.BisonClient) -> None:
-    """Fetch all sender emails and batch-upsert today's stats into sender_daily_stats."""
+    """Fetch all sender emails and batch-upsert today's stats into sender_daily_stats.
+
+    Bison's /sender-emails payload names its counters total_replied_count /
+    total_opened_count (NOT emails_replied_count / emails_opened_count — reading
+    those wrote 0 replies for every sender until 2026-07-29). Warmup counters
+    live on the separate /warmup/sender-emails payload, merged in by sender id.
+    """
     supabase = get_supabase()
     today = _today()
 
     senders = bison.get_sender_emails()
     logger.info(f"[{workspace_id}] Polling stats for {len(senders)} senders")
 
+    warmup_by_id: dict = {}
+    try:
+        for w in bison.get_warmup_sender_emails():
+            if w.get("id") is not None:
+                warmup_by_id[int(w["id"])] = w
+    except Exception as e:
+        logger.warning(f"[{workspace_id}] warmup sender fetch failed, warmup counters skipped: {e}")
+
     rows = []
     for sender in senders:
         email = sender.get("email", "")
         domain = email.split("@")[1] if "@" in email else ""
+        sender_id = int(sender.get("id") or 0)
+        warmup = warmup_by_id.get(sender_id, {})
         rows.append({
             "workspace_id": workspace_id,
-            "sender_email_id": int(sender.get("id") or 0),
+            "sender_email_id": sender_id,
             "sender_email": email,
             "domain": domain,
             "stat_date": today,
             "emails_sent": sender.get("emails_sent_count", 0) or 0,
-            "emails_opened": sender.get("emails_opened_count", 0) or 0,
-            "emails_replied": sender.get("emails_replied_count", 0) or 0,
+            "emails_opened": sender.get("total_opened_count", 0) or 0,
+            "emails_replied": sender.get("total_replied_count", 0) or 0,
             "emails_bounced": sender.get("bounced_count", 0) or 0,
-            "warmup_sent": sender.get("warmup_sent_count", 0) or 0,
-            "warmup_replied": sender.get("warmup_replied_count", 0) or 0,
+            "warmup_sent": warmup.get("warmup_emails_sent", 0) or 0,
+            "warmup_replied": warmup.get("warmup_replies_received", 0) or 0,
             "daily_limit": sender.get("daily_limit", 0) or 0,
             "warmup_enabled": bool(sender.get("warmup_enabled", False)),
             "fetched_at": datetime.now(timezone.utc).isoformat(),
