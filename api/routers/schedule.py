@@ -50,15 +50,26 @@ def _plan_snapshot(today: str, ws_ids: List[str]) -> Dict[str, List[dict]]:
 
 
 @router.get("/schedule/today", dependencies=[Security(require_api_key)])
-def schedule_today(workspace_id: Optional[str] = None):
-    """Today's sending schedule (UTC day) per campaign and per inbox.
+def schedule_today(workspace_id: Optional[str] = None, date: Optional[str] = None):
+    """Sending schedule for one UTC send day, per campaign and per inbox.
+
+    Defaults to the current UTC day; pass `date` (YYYY-MM-DD) for another day.
+    Past/current days use the midnight plan snapshot when available (fast);
+    future days page the live Bison queue for items scheduled that day (slow,
+    but cached).
 
     planned_total/planned_today reflect the *current* Bison queue (remaining).
     plan_total is the midnight snapshot of the full day's plan (null until the
     first snapshot exists); sent_total is live sent-so-far from Bison.
     Cached ~10 minutes; the manual data refresh busts the cache.
     """
-    today = datetime.now(timezone.utc).date().isoformat()
+    utc_today = datetime.now(timezone.utc).date().isoformat()
+    today = utc_today
+    if date:
+        try:
+            today = datetime.strptime(date[:10], "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            pass
     ws_filter = workspace_id if workspace_id and workspace_id != "all" else None
     cache_key = f"schedule_today:{ws_filter or 'all'}:{today}"
 
@@ -96,9 +107,13 @@ def schedule_today(workspace_id: Optional[str] = None):
                     campaigns.extend(slow)
             except Exception as e:
                 logger.warning(f"schedule fetch failed for workspace {ws['id']}: {e}")
-            ws_sent = send_schedule.sent_today_for_workspace(ws["id"], today)
-            if ws_sent is not None:
-                sent_total = (sent_total or 0) + ws_sent
+            if today > utc_today:
+                # Future day: nothing sent yet by definition — skip the lookup.
+                sent_total = (sent_total or 0)
+            else:
+                ws_sent = send_schedule.sent_today_for_workspace(ws["id"], today)
+                if ws_sent is not None:
+                    sent_total = (sent_total or 0) + ws_sent
 
         campaigns.sort(key=lambda c: -c["planned_today"])
         remaining_total = sum(c["planned_today"] for c in campaigns)
