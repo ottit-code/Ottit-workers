@@ -25,10 +25,14 @@ def _sources() -> list[tuple]:
         reply_events_poller,
         delivery_poller,
         inboxassure_poller,
+        send_plan_snapshotter,
     )
     from lib import inboxassure
 
     sources: list[tuple] = [
+        # First: pre-capture tomorrow's send plan so the Daily Review's
+        # Tomorrow card serves from Supabase instead of paging Bison live.
+        ("tomorrow_send_plan", send_plan_snapshotter.run_tomorrow),
         ("sender_and_workspace_stats", stats_poller.run),
         ("campaign_daily_stats", campaign_daily_stats_poller.run),
         ("sender_performance", sender_performance_poller.run),

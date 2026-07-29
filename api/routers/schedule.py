@@ -34,7 +34,7 @@ def _plan_snapshot(today: str, ws_ids: List[str]) -> Dict[str, List[dict]]:
         rows = (
             get_supabase()
             .table("daily_send_plan")
-            .select("workspace_id,campaign_id,campaign_name,planned,inboxes")
+            .select("workspace_id,campaign_id,campaign_name,planned,inboxes,captured_at")
             .eq("plan_date", today)
             .in_("workspace_id", ws_ids)
             .execute()
@@ -85,10 +85,35 @@ def schedule_today(workspace_id: Optional[str] = None, date: Optional[str] = Non
         campaigns: List[Dict[str, Any]] = []
         sent_total: Optional[int] = None
         plan_total: Optional[int] = None
+        snapshot_at: Optional[str] = None
         for ws in workspaces:
             snap_rows = snapshot.get(ws["id"]) or []
             try:
-                if snap_rows:
+                if snap_rows and today > utc_today:
+                    # Future day, pre-captured by deep_refresh: serve straight
+                    # from Supabase — nothing is sent yet, so remaining ==
+                    # planned and no Bison calls are needed at all.
+                    for r in snap_rows:
+                        planned = int(r.get("planned") or 0)
+                        campaigns.append({
+                            "workspace_id": ws["id"],
+                            "workspace_name": ws["name"],
+                            "campaign_id": str(r["campaign_id"]),
+                            "campaign_name": r.get("campaign_name") or "",
+                            "planned_today": planned,
+                            "planned_start": planned,
+                            "sent_today": None,
+                            "overdue_today": None,
+                            "inboxes": r.get("inboxes") or [],
+                            "error": None,
+                        })
+                        cap = r.get("captured_at")
+                        if cap and (snapshot_at is None or cap > snapshot_at):
+                            snapshot_at = cap
+                    plan_total = (plan_total or 0) + sum(
+                        int(r.get("planned") or 0) for r in snap_rows
+                    )
+                elif snap_rows:
                     # Fast path: remaining derived from the midnight plan and
                     # per-campaign sent-today (seconds, not minutes).
                     fast = send_schedule.plan_from_snapshot(ws, today, snap_rows)
@@ -124,7 +149,8 @@ def schedule_today(workspace_id: Optional[str] = None, date: Optional[str] = Non
         )
         return {
             "date": today,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            # For snapshot-served future days, "as of" is the capture time.
+            "generated_at": snapshot_at or datetime.now(timezone.utc).isoformat(),
             # Back-compat: planned_total has always been the live queue.
             "planned_total": remaining_total,
             "remaining_total": remaining_total,

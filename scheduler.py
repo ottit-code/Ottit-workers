@@ -3,9 +3,9 @@ scheduler.py — main entry point
 
 Runs all pollers on their schedules:
 - deep_refresh:                  every 3 hours at 00/03/06/09/12/15/18/21 UTC
-                                 (stats, campaign daily stats, sender
-                                 performance, reply events, deliverability,
-                                 InboxAssure — run sequentially)
+                                 (tomorrow's send plan, stats, campaign daily
+                                 stats, sender performance, reply events,
+                                 deliverability, InboxAssure — sequential)
 - notifier:                      every 15 minutes
 - ab_test_snapshots_poller:      every 6 hours
 - lead_engagement_poller:        daily at 2 AM
