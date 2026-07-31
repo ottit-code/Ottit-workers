@@ -193,11 +193,12 @@ def campaign_sent_on_day(client, campaign_id: str, day: str) -> Optional[int]:
 
 
 def plan_from_snapshot(ws: dict, day: str, snapshot_rows: List[dict]) -> List[Dict[str, Any]]:
-    """Fast schedule view derived from the midnight plan snapshot.
+    """Approximate schedule view derived from the midnight plan snapshot.
 
-    remaining = planned - sent_today per campaign (one chart-stats call each)
-    instead of paging Bison's scheduled-emails queue, which can take minutes
-    on high-volume days. Inbox breakdowns show the *planned* midnight split.
+    remaining ≈ planned - sent_today per campaign. This OVERCOUNTS when Bison
+    still holds overdue items (slot passed, will roll to later days) — prefer
+    plan_for_workspace for exact remaining. Kept as a fallback when live queue
+    paging fails. Inbox breakdowns show the *planned* midnight split.
     """
     client = emailbison.for_workspace(ws["id"])
 
@@ -214,6 +215,7 @@ def plan_from_snapshot(ws: dict, day: str, snapshot_rows: List[dict]) -> List[Di
             "planned_today": remaining,
             "planned_start": planned,
             "sent_today": sent,
+            "overdue_today": None,  # unknown without queue paging
             "inboxes": row.get("inboxes") or [],
             "error": None if sent is not None else "sent_lookup_failed",
         }
