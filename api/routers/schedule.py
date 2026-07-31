@@ -9,9 +9,12 @@ GET /schedule/today reports three numbers for the current UTC day:
 Read-only: never mutates anything on the Bison side.
 
 Each workspace is cached independently (~10 min). "All workspaces" is the
-sum of those same per-workspace entries, so all == v1 + v2. Manual data
-refresh (POST /actions/refresh) clears the cache so the next request
-re-fetches.
+sum of those same per-workspace entries, so all == v1 + v2.
+
+For the current/past day with a midnight snapshot, the first response is a
+fast planned-sent estimate (seconds). A background job then pages the live
+Bison queue and replaces the cache with exact remaining + overdue. Future
+days with a pre-capture serve entirely from Supabase (instant).
 """
 from __future__ import annotations
 
@@ -51,6 +54,35 @@ def _plan_snapshot(today: str, ws_ids: List[str]) -> Dict[str, List[dict]]:
     except Exception as e:
         logger.warning(f"daily_send_plan read failed: {e}")
         return {}
+
+
+def _finalize(
+    campaigns: List[Dict[str, Any]],
+    *,
+    today: str,
+    plan_total: Optional[int],
+    sent_total: Optional[int],
+    generated_at: Optional[str],
+    approximate: bool = False,
+) -> Dict[str, Any]:
+    campaigns = sorted(campaigns, key=lambda c: -c["planned_today"])
+    remaining_total = sum(c["planned_today"] for c in campaigns)
+    overdues = [c.get("overdue_today") for c in campaigns]
+    overdue_total = (
+        sum(o for o in overdues if o is not None)
+        if any(o is not None for o in overdues) else None
+    )
+    return {
+        "date": today,
+        "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
+        "planned_total": remaining_total,
+        "remaining_total": remaining_total,
+        "overdue_total": overdue_total,
+        "plan_total": plan_total,
+        "sent_total": sent_total,
+        "approximate": approximate,
+        "campaigns": campaigns,
+    }
 
 
 def _merge_live_with_snapshot(
@@ -107,94 +139,104 @@ def _merge_live_with_snapshot(
     return campaigns, plan_total, snapshot_at
 
 
-def _build_workspace(
+def _build_fast_from_snapshot(
+    ws: dict, today: str, snap_rows: List[dict]
+) -> Dict[str, Any]:
+    """Seconds-fast estimate: remaining ≈ planned - sent (may include overdue)."""
+    campaigns = send_schedule.plan_from_snapshot(ws, today, snap_rows)
+    plan_total = sum(int(r.get("planned") or 0) for r in snap_rows)
+    snapshot_at = None
+    for r in snap_rows:
+        cap = r.get("captured_at")
+        if cap and (snapshot_at is None or cap > snapshot_at):
+            snapshot_at = cap
+    sent_total = send_schedule.sent_today_for_workspace(ws["id"], today)
+    return _finalize(
+        campaigns,
+        today=today,
+        plan_total=plan_total,
+        sent_total=sent_total,
+        generated_at=snapshot_at,
+        approximate=True,
+    )
+
+
+def _build_future_from_snapshot(
+    ws: dict, today: str, snap_rows: List[dict]
+) -> Dict[str, Any]:
+    """Future day pre-capture — remaining == planned, no Bison calls."""
+    campaigns: List[Dict[str, Any]] = []
+    snapshot_at: Optional[str] = None
+    for r in snap_rows:
+        planned = int(r.get("planned") or 0)
+        campaigns.append({
+            "workspace_id": ws["id"],
+            "workspace_name": ws["name"],
+            "campaign_id": str(r["campaign_id"]),
+            "campaign_name": r.get("campaign_name") or "",
+            "planned_today": planned,
+            "planned_start": planned,
+            "sent_today": None,
+            "overdue_today": None,
+            "inboxes": r.get("inboxes") or [],
+            "error": None,
+        })
+        cap = r.get("captured_at")
+        if cap and (snapshot_at is None or cap > snapshot_at):
+            snapshot_at = cap
+    plan_total = sum(int(r.get("planned") or 0) for r in snap_rows)
+    return _finalize(
+        campaigns,
+        today=today,
+        plan_total=plan_total,
+        sent_total=0,
+        generated_at=snapshot_at,
+        approximate=False,
+    )
+
+
+def _build_live(
     ws: dict, today: str, utc_today: str, snap_rows: List[dict]
 ) -> Dict[str, Any]:
-    """Schedule payload for a single workspace."""
+    """Exact remaining from the live Bison queue (slow; excludes overdue)."""
     campaigns: List[Dict[str, Any]] = []
     plan_total: Optional[int] = None
     snapshot_at: Optional[str] = None
 
     try:
         if snap_rows and today > utc_today:
-            # Future day, pre-captured by deep_refresh: serve straight from
-            # Supabase — nothing is sent yet, so remaining == planned.
-            for r in snap_rows:
-                planned = int(r.get("planned") or 0)
-                campaigns.append({
-                    "workspace_id": ws["id"],
-                    "workspace_name": ws["name"],
-                    "campaign_id": str(r["campaign_id"]),
-                    "campaign_name": r.get("campaign_name") or "",
-                    "planned_today": planned,
-                    "planned_start": planned,
-                    "sent_today": None,
-                    "overdue_today": None,
-                    "inboxes": r.get("inboxes") or [],
-                    "error": None,
-                })
-                cap = r.get("captured_at")
-                if cap and (snapshot_at is None or cap > snapshot_at):
-                    snapshot_at = cap
-            plan_total = sum(int(r.get("planned") or 0) for r in snap_rows)
-        elif snap_rows:
-            # Current/past day with a midnight plan: page the live queue for
-            # exact remaining (excludes overdue). planned - sent overcounts
-            # because Bison keeps overdue items that roll to later days.
-            try:
-                live = send_schedule.plan_for_workspace(ws, today)
-                for c in live:
-                    c["sent_today"] = None
-                campaigns, plan_total, snapshot_at = _merge_live_with_snapshot(
-                    ws, live, snap_rows
-                )
-            except Exception as e:
-                # Live paging failed — approximate remaining as planned - sent
-                # (may include overdue) so the card isn't empty.
-                logger.warning(
-                    f"live schedule failed for {ws['id']}, falling back to snapshot: {e}"
-                )
-                fast = send_schedule.plan_from_snapshot(ws, today, snap_rows)
-                for c in fast:
-                    c["overdue_today"] = None
-                campaigns = fast
-                plan_total = sum(int(r.get("planned") or 0) for r in snap_rows)
-                for r in snap_rows:
-                    cap = r.get("captured_at")
-                    if cap and (snapshot_at is None or cap > snapshot_at):
-                        snapshot_at = cap
+            return _build_future_from_snapshot(ws, today, snap_rows)
+        if snap_rows:
+            live = send_schedule.plan_for_workspace(ws, today)
+            for c in live:
+                c["sent_today"] = None
+            campaigns, plan_total, snapshot_at = _merge_live_with_snapshot(
+                ws, live, snap_rows
+            )
         else:
-            # No snapshot yet: page the live queue (slow but exact).
             live = send_schedule.plan_for_workspace(ws, today)
             for c in live:
                 c["planned_start"] = None
                 c["sent_today"] = None
             campaigns = live
     except Exception as e:
-        logger.warning(f"schedule fetch failed for workspace {ws['id']}: {e}")
+        logger.warning(f"live schedule fetch failed for workspace {ws['id']}: {e}")
+        if snap_rows:
+            return _build_fast_from_snapshot(ws, today, snap_rows)
 
     if today > utc_today:
         sent_total: Optional[int] = 0
     else:
         sent_total = send_schedule.sent_today_for_workspace(ws["id"], today)
 
-    campaigns.sort(key=lambda c: -c["planned_today"])
-    remaining_total = sum(c["planned_today"] for c in campaigns)
-    overdues = [c.get("overdue_today") for c in campaigns]
-    overdue_total = (
-        sum(o for o in overdues if o is not None)
-        if any(o is not None for o in overdues) else None
+    return _finalize(
+        campaigns,
+        today=today,
+        plan_total=plan_total,
+        sent_total=sent_total,
+        generated_at=snapshot_at,
+        approximate=False,
     )
-    return {
-        "date": today,
-        "generated_at": snapshot_at or datetime.now(timezone.utc).isoformat(),
-        "planned_total": remaining_total,
-        "remaining_total": remaining_total,
-        "overdue_total": overdue_total,
-        "plan_total": plan_total,
-        "sent_total": sent_total,
-        "campaigns": campaigns,
-    }
 
 
 def _merge_workspaces(parts: List[Dict[str, Any]], today: str) -> Dict[str, Any]:
@@ -202,9 +244,6 @@ def _merge_workspaces(parts: List[Dict[str, Any]], today: str) -> Dict[str, Any]
     campaigns: List[Dict[str, Any]] = []
     for part in parts:
         campaigns.extend(part.get("campaigns") or [])
-    campaigns.sort(key=lambda c: -c["planned_today"])
-
-    remaining_total = sum(c["planned_today"] for c in campaigns)
 
     sent_vals = [p.get("sent_total") for p in parts]
     sent_total: Optional[int] = (
@@ -218,49 +257,66 @@ def _merge_workspaces(parts: List[Dict[str, Any]], today: str) -> Dict[str, Any]
         if any(p is not None for p in plan_vals) else None
     )
 
-    overdue_vals = [p.get("overdue_total") for p in parts]
-    overdue_total: Optional[int] = (
-        sum(o for o in overdue_vals if o is not None)
-        if any(o is not None for o in overdue_vals) else None
-    )
-
     generated_ats = [p.get("generated_at") for p in parts if p.get("generated_at")]
     generated_at = max(generated_ats) if generated_ats else datetime.now(timezone.utc).isoformat()
+    approximate = any(p.get("approximate") for p in parts)
 
-    return {
-        "date": today,
-        "generated_at": generated_at,
-        "planned_total": remaining_total,
-        "remaining_total": remaining_total,
-        "overdue_total": overdue_total,
-        "plan_total": plan_total,
-        "sent_total": sent_total,
-        "campaigns": campaigns,
-    }
+    merged = _finalize(
+        campaigns,
+        today=today,
+        plan_total=plan_total,
+        sent_total=sent_total,
+        generated_at=generated_at,
+        approximate=approximate,
+    )
+    # Prefer summed per-workspace overdue totals — approximate payloads leave
+    # campaign.overdue_today null even when the workspace total is known later.
+    overdue_vals = [p.get("overdue_total") for p in parts]
+    if any(o is not None for o in overdue_vals):
+        merged["overdue_total"] = sum(o for o in overdue_vals if o is not None)
+    return merged
 
 
 def _get_workspace_schedule(
     ws: dict, today: str, utc_today: str, snap_rows: List[dict]
 ) -> Dict[str, Any]:
-    """Cached per-workspace schedule (stale-while-revalidate)."""
+    """Cached per-workspace schedule (stale-while-revalidate).
+
+    Cold cache for a snapshotted current/past day returns the fast estimate
+    immediately and rebuilds exact remaining in the background — so Daily
+    Review never blocks on minutes of Bison queue paging.
+    """
     cache_key = f"schedule_today:{ws['id']}:{today}"
 
-    def build() -> Dict[str, Any]:
-        # Re-read snapshot inside build so background revalidation sees fresh rows.
+    def build_live() -> Dict[str, Any]:
         snapshot = _plan_snapshot(today, [ws["id"]])
-        return _build_workspace(ws, today, utc_today, snapshot.get(ws["id"]) or [])
+        return _build_live(ws, today, utc_today, snapshot.get(ws["id"]) or [])
 
     cached, fresh = _cache_get_stale(cache_key)
     if fresh:
+        # Approximate entries should still be upgraded to live in the background.
+        if cached.get("approximate"):
+            _cache_revalidate(cache_key, build_live, _SCHEDULE_CACHE_TTL)
         return cached
     if cached is not None:
-        # Building can take ~20s of Bison paging; serve stale and rebuild.
-        _cache_revalidate(cache_key, build, _SCHEDULE_CACHE_TTL)
+        _cache_revalidate(cache_key, build_live, _SCHEDULE_CACHE_TTL)
         return cached
 
-    # Cold cache: if the caller already loaded snap_rows, use them to avoid
-    # a duplicate Supabase round-trip on the blocking path.
-    payload = _build_workspace(ws, today, utc_today, snap_rows)
+    # Cold cache.
+    if snap_rows and today > utc_today:
+        payload = _build_future_from_snapshot(ws, today, snap_rows)
+        _cache_set(cache_key, payload, _SCHEDULE_CACHE_TTL)
+        return payload
+
+    if snap_rows:
+        # Instant response, then exact live remaining in the background.
+        payload = _build_fast_from_snapshot(ws, today, snap_rows)
+        _cache_set(cache_key, payload, _SCHEDULE_CACHE_TTL)
+        _cache_revalidate(cache_key, build_live, _SCHEDULE_CACHE_TTL)
+        return payload
+
+    # No snapshot — must page live (slow). Still cache the result.
+    payload = build_live()
     _cache_set(cache_key, payload, _SCHEDULE_CACHE_TTL)
     return payload
 
@@ -270,10 +326,9 @@ def schedule_today(workspace_id: Optional[str] = None, date: Optional[str] = Non
     """Sending schedule for one UTC send day, per campaign and per inbox.
 
     Defaults to the current UTC day; pass `date` (YYYY-MM-DD) for another day.
-    Remaining always comes from the live Bison queue (future-scheduled only;
-    overdue items are reported separately). The midnight plan snapshot supplies
-    plan_total when available; future days with a pre-capture serve entirely
-    from Supabase.
+    Current/past days with a midnight snapshot return a fast estimate first
+    (approximate=true); a background job replaces the cache with exact live
+    remaining (excludes overdue). Future days with a pre-capture are instant.
 
     Each workspace is cached ~10 minutes independently. Omitting workspace_id
     (or passing "all") sums those same cached entries, so all == v1 + v2.
@@ -301,6 +356,7 @@ def schedule_today(workspace_id: Optional[str] = None, date: Optional[str] = Non
             "overdue_total": None,
             "plan_total": None,
             "sent_total": None,
+            "approximate": False,
             "campaigns": [],
         }
 
@@ -311,7 +367,6 @@ def schedule_today(workspace_id: Optional[str] = None, date: Optional[str] = Non
             ws, today, utc_today, snapshot.get(ws["id"]) or []
         )
 
-    # Build workspaces concurrently so "all" cold-cache isn't 2× sequential.
     with ThreadPoolExecutor(max_workers=len(workspaces)) as pool:
         parts = list(
             pool.map(

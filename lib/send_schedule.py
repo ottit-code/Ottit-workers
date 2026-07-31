@@ -23,11 +23,24 @@ ACTIVE_STATUSES = {"active", "running"}
 _PAGE_WORKERS = 10
 
 
-def fetch_scheduled_emails(client, campaign_id: str) -> List[dict]:
-    """All scheduled emails for a campaign, following Laravel-style pagination.
+def _page_days(rows: list) -> List[str]:
+    days: List[str] = []
+    for item in rows:
+        d = scheduled_day_utc(item)
+        if d:
+            days.append(d)
+    return days
+
+
+def fetch_scheduled_emails(
+    client, campaign_id: str, through_day: Optional[str] = None
+) -> List[dict]:
+    """Scheduled emails for a campaign, following Laravel-style pagination.
 
     Pages are fetched concurrently (Bison ignores per_page and always returns
-    15/page, so large queues would otherwise take minutes sequentially).
+    15/page). When `through_day` is set and the queue is ascending by
+    scheduled_date (Bison's default), paging stops after the last page that
+    can still contain that day — weeks of future backlog are skipped.
     """
     first = client.get(
         f"/api/campaigns/{campaign_id}/scheduled-emails", params={"page": 1}
@@ -55,8 +68,45 @@ def fetch_scheduled_emails(client, campaign_id: str) -> List[dict]:
             )
             return []
 
+    end_page = last_page
+    already_have_last = False
+    if through_day and last_page > 1:
+        # Probe the last page. If everything there is after through_day and
+        # page 1 still has through_day-or-earlier items, binary-search the
+        # cutover so we don't download the entire future backlog.
+        last_rows = one_page(last_page)
+        first_days = _page_days(rows)
+        last_days = _page_days(last_rows)
+        if (
+            first_days
+            and last_days
+            and min(first_days) <= through_day < min(last_days)
+        ):
+            lo, hi = 1, last_page
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                mid_rows = one_page(mid) if mid != last_page else last_rows
+                mid_days = _page_days(mid_rows)
+                if mid_days and min(mid_days) > through_day:
+                    hi = mid - 1
+                else:
+                    lo = mid
+            end_page = max(lo, 1)
+        if end_page >= last_page:
+            rows.extend(last_rows)
+            already_have_last = True
+
+    if end_page <= 1:
+        return rows
+
+    pages = list(range(2, end_page + 1))
+    if already_have_last:
+        pages = [p for p in pages if p != last_page]
+    if not pages:
+        return rows
+
     with ThreadPoolExecutor(max_workers=_PAGE_WORKERS) as pool:
-        for batch in pool.map(one_page, range(2, last_page + 1)):
+        for batch in pool.map(one_page, pages):
             rows.extend(batch)
     return rows
 
@@ -146,7 +196,8 @@ def plan_for_workspace(ws: dict, day: str) -> List[Dict[str, Any]]:
             "error": None,
         }
         try:
-            items = fetch_scheduled_emails(client, cid)
+            # Only page through the target day — skip weeks of future backlog.
+            items = fetch_scheduled_emails(client, cid, through_day=day)
         except Exception as e:
             logger.warning(f"scheduled-emails fetch failed for campaign {cid}: {e}")
             entry["error"] = "fetch_failed"

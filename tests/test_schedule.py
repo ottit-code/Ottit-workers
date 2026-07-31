@@ -94,6 +94,7 @@ def test_merge_workspaces_sums_to_all():
         "overdue_total": 10,
         "plan_total": 200,
         "sent_total": 90,
+        "approximate": False,
         "campaigns": [
             {"campaign_id": "a", "planned_today": 100, "workspace_id": "ws_v1"},
         ],
@@ -106,6 +107,7 @@ def test_merge_workspaces_sums_to_all():
         "overdue_total": 446,
         "plan_total": 6000,
         "sent_total": 200,
+        "approximate": True,
         "campaigns": [
             {"campaign_id": "b", "planned_today": 5341, "workspace_id": "ws_v2"},
         ],
@@ -118,5 +120,6 @@ def test_merge_workspaces_sums_to_all():
     assert all_ws["plan_total"] == 200 + 6000
     assert all_ws["sent_total"] == 90 + 200
     assert all_ws["overdue_total"] == 10 + 446
+    assert all_ws["approximate"] is True
     assert len(all_ws["campaigns"]) == 2
     assert all_ws["generated_at"] == "2026-08-01T12:05:00+00:00"
