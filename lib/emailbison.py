@@ -1,3 +1,5 @@
+import json
+
 import httpx
 from lib.config import DEFAULT_WORKSPACE_ID, EMAILBISON_API_TOKEN, get_workspace
 from lib.http_retry import retry_transient
@@ -29,6 +31,20 @@ class BisonClient:
     @retry_transient
     def get(self, path: str, params: dict | None = None) -> dict | list:
         res = self._client.get(path, params=params)
+        res.raise_for_status()
+        return res.json()
+
+    @retry_transient
+    def get_with_body(self, path: str, body: dict) -> dict | list:
+        """GET with a JSON body — several Bison endpoints require this
+        (e.g. /api/campaigns/sending-schedules). httpx.Client.get() rejects
+        json=, so we go through request()."""
+        res = self._client.request(
+            "GET",
+            path,
+            content=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
         res.raise_for_status()
         return res.json()
 
@@ -85,8 +101,17 @@ class BisonClient:
         params = {"campaign_id": campaign_id} if campaign_id else None
         return self.get_all("/api/replies", params=params, max_pages=max_pages)
 
-    def get_campaign_events_stats(self, start_date: str, end_date: str) -> dict:
-        return self.get("/api/campaign-events/stats", params={"start_date": start_date, "end_date": end_date})
+    def get_campaign_events_stats(
+        self,
+        start_date: str,
+        end_date: str,
+        campaign_ids: list[int | str] | None = None,
+    ) -> dict | list:
+        """Workspace (or campaign-filtered) event series — Sent/Opened/etc."""
+        params: dict = {"start_date": start_date, "end_date": end_date}
+        if campaign_ids:
+            params["campaign_ids"] = [int(c) for c in campaign_ids]
+        return self.get("/api/campaign-events/stats", params=params)
 
     def get_workspace_chart_stats(self, start_date: str, end_date: str) -> dict:
         return self.get("/api/workspaces/v1.1/line-area-chart-stats", params={"start_date": start_date, "end_date": end_date})
@@ -107,12 +132,30 @@ class BisonClient:
     def get_campaign_scheduled_emails(self, campaign_id: str) -> list:
         return self.get_all(f"/api/campaigns/{campaign_id}/scheduled-emails")
 
+    def get_sending_schedules(self, day: str) -> list:
+        """Per-campaign emails_being_sent for today|tomorrow|day_after_tomorrow.
+
+        One call replaces paging /api/campaigns/{id}/scheduled-emails (15/page).
+        """
+        if day not in {"today", "tomorrow", "day_after_tomorrow"}:
+            raise ValueError(f"invalid sending-schedules day: {day}")
+        data = self.get_with_body("/api/campaigns/sending-schedules", {"day": day})
+        return self._extract_list(data)
+
     def get_campaign_line_area_chart_stats(self, campaign_id: str, start_date: str, end_date: str) -> dict | list:
         return self.get(f"/api/campaigns/{campaign_id}/line-area-chart-stats",
                         params={"start_date": start_date, "end_date": end_date})
 
-    def get_campaign_stats(self, campaign_id: str) -> dict:
-        return self.post(f"/api/campaigns/{campaign_id}/stats")
+    def get_campaign_stats(
+        self,
+        campaign_id: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
+        body: dict = {}
+        if start_date and end_date:
+            body = {"start_date": start_date, "end_date": end_date}
+        return self.post(f"/api/campaigns/{campaign_id}/stats", body or None)
 
     def get_campaign_details(self, campaign_id: str) -> dict:
         res = self.get(f"/api/campaigns/{campaign_id}")
@@ -207,11 +250,16 @@ def get_campaign_sequence_steps(campaign_id: str) -> list:
 def get_campaign_scheduled_emails(campaign_id: str) -> list:
     return _default_client.get_campaign_scheduled_emails(campaign_id)
 
+def get_sending_schedules(day: str) -> list:
+    return _default_client.get_sending_schedules(day)
+
 def get_campaign_line_area_chart_stats(campaign_id: str, start_date: str, end_date: str) -> dict | list:
     return _default_client.get_campaign_line_area_chart_stats(campaign_id, start_date, end_date)
 
-def get_campaign_stats(campaign_id: str) -> dict:
-    return _default_client.get_campaign_stats(campaign_id)
+def get_campaign_stats(
+    campaign_id: str, start_date: str | None = None, end_date: str | None = None
+) -> dict:
+    return _default_client.get_campaign_stats(campaign_id, start_date, end_date)
 
 def get_campaign_details(campaign_id: str) -> dict:
     return _default_client.get_campaign_details(campaign_id)

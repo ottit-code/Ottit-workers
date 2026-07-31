@@ -165,9 +165,76 @@ def inbox_email(item: dict) -> str:
     return "unknown"
 
 
+def relative_schedule_day(day: str, now: Optional[datetime] = None) -> Optional[str]:
+    """Map a YYYY-MM-DD UTC day onto Bison's sending-schedules enum.
+
+    Returns "today" | "tomorrow" | "day_after_tomorrow", or None when the day
+    is outside that 3-day window (past days / further future).
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        target = datetime.strptime(day[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    delta = (target - now.date()).days
+    if delta == 0:
+        return "today"
+    if delta == 1:
+        return "tomorrow"
+    if delta == 2:
+        return "day_after_tomorrow"
+    return None
+
+
+def plan_from_sending_schedules(ws: dict, day: str) -> Optional[List[Dict[str, Any]]]:
+    """Remaining counts from GET /api/campaigns/sending-schedules (one call).
+
+    Uses Bison's own emails_being_sent aggregate — the same number the product
+    UI shows — instead of paging scheduled-emails at 15/row. Only works for
+    today / tomorrow / day_after_tomorrow. Returns None when the day is out
+    of range so callers can fall back.
+    """
+    relative = relative_schedule_day(day)
+    if relative is None:
+        return None
+    client = emailbison.for_workspace(ws["id"])
+    try:
+        rows = client.get_sending_schedules(relative)
+    except Exception as e:
+        logger.warning(f"sending-schedules failed for {ws['id']} ({relative}): {e}")
+        return None
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        campaign = r.get("campaign") or {}
+        cid = str(r.get("campaign_id") or campaign.get("id") or "")
+        if not cid:
+            continue
+        remaining = int(r.get("emails_being_sent") or 0)
+        # Skip drained campaigns — keeps the card focused on what's still going.
+        if remaining <= 0:
+            continue
+        out.append({
+            "workspace_id": ws["id"],
+            "workspace_name": ws["name"],
+            "campaign_id": cid,
+            "campaign_name": campaign.get("name") or "",
+            "planned_today": remaining,
+            "overdue_today": None,  # aggregate does not split overdue vs future
+            "inboxes": [],  # no per-inbox breakdown on this endpoint
+            "error": None,
+            "source": "sending_schedules",
+        })
+    return out
+
+
 def plan_for_workspace(ws: dict, day: str) -> List[Dict[str, Any]]:
     """Queued sends for the given UTC day, per active campaign (with per-inbox
     breakdown).
+
+    Prefer plan_from_sending_schedules for today/tomorrow totals — this path
+    pages Bison's scheduled-emails queue and is reserved for midnight
+    snapshots (inbox breakdown) and days outside the 3-day aggregate window.
 
     Bison's queue keeps items whose scheduled time has already passed without
     sending (daily limits etc.) — those roll over to later days, so they are

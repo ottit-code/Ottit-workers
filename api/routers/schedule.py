@@ -3,18 +3,13 @@
 GET /schedule/today reports three numbers for the current UTC day:
 - planned:   full day's plan, captured at UTC midnight by send_plan_snapshotter
 - sent:      emails actually sent so far today (live Bison workspace stats)
-- remaining: what's still queued in Bison's scheduled-emails right now
-             (future-scheduled only — overdue items are excluded)
+- remaining: emails_being_sent from Bison's /campaigns/sending-schedules
+             (one call — same aggregate the product UI uses)
 
 Read-only: never mutates anything on the Bison side.
 
 Each workspace is cached independently (~10 min). "All workspaces" is the
 sum of those same per-workspace entries, so all == v1 + v2.
-
-For the current/past day with a midnight snapshot, the first response is a
-fast planned-sent estimate (seconds). A background job then pages the live
-Bison queue and replaces the cache with exact remaining + overdue. Future
-days with a pre-capture serve entirely from Supabase (instant).
 """
 from __future__ import annotations
 
@@ -198,26 +193,40 @@ def _build_future_from_snapshot(
 def _build_live(
     ws: dict, today: str, utc_today: str, snap_rows: List[dict]
 ) -> Dict[str, Any]:
-    """Exact remaining from the live Bison queue (slow; excludes overdue)."""
+    """Live remaining from Bison's sending-schedules aggregate (one call).
+
+    Falls back to queue paging only when the day is outside Bison's
+    today/tomorrow/day_after_tomorrow window, and to planned−sent when both
+    live paths fail.
+    """
     campaigns: List[Dict[str, Any]] = []
     plan_total: Optional[int] = None
     snapshot_at: Optional[str] = None
 
     try:
-        if snap_rows and today > utc_today:
+        if snap_rows and today > utc_today and send_schedule.relative_schedule_day(today) is None:
+            # Far-future day with a pre-capture and no aggregate — Supabase only.
             return _build_future_from_snapshot(ws, today, snap_rows)
-        if snap_rows:
+
+        # Preferred: one-call aggregate (real emails_being_sent).
+        live = send_schedule.plan_from_sending_schedules(ws, today)
+        if live is None:
+            # Outside the 3-day window (or aggregate failed) — page the queue.
+            logger.info(
+                f"sending-schedules unavailable for {ws['id']} {today}; "
+                f"falling back to scheduled-emails paging"
+            )
             live = send_schedule.plan_for_workspace(ws, today)
-            for c in live:
-                c["sent_today"] = None
+
+        for c in live:
+            c["sent_today"] = None
+        if snap_rows:
             campaigns, plan_total, snapshot_at = _merge_live_with_snapshot(
                 ws, live, snap_rows
             )
         else:
-            live = send_schedule.plan_for_workspace(ws, today)
             for c in live:
-                c["planned_start"] = None
-                c["sent_today"] = None
+                c.setdefault("planned_start", None)
             campaigns = live
     except Exception as e:
         logger.warning(f"live schedule fetch failed for workspace {ws['id']}: {e}")
@@ -234,7 +243,7 @@ def _build_live(
         today=today,
         plan_total=plan_total,
         sent_total=sent_total,
-        generated_at=snapshot_at,
+        generated_at=datetime.now(timezone.utc).isoformat(),
         approximate=False,
     )
 
@@ -282,9 +291,9 @@ def _get_workspace_schedule(
 ) -> Dict[str, Any]:
     """Cached per-workspace schedule (stale-while-revalidate).
 
-    Cold cache for a snapshotted current/past day returns the fast estimate
-    immediately and rebuilds exact remaining in the background — so Daily
-    Review never blocks on minutes of Bison queue paging.
+    Remaining comes from Bison's sending-schedules aggregate (one call). Far-
+    future days with a Supabase pre-capture skip Bison entirely. Queue paging
+    is only a fallback.
     """
     cache_key = f"schedule_today:{ws['id']}:{today}"
 
@@ -294,7 +303,6 @@ def _get_workspace_schedule(
 
     cached, fresh = _cache_get_stale(cache_key)
     if fresh:
-        # Approximate entries should still be upgraded to live in the background.
         if cached.get("approximate"):
             _cache_revalidate(cache_key, build_live, _SCHEDULE_CACHE_TTL)
         return cached
@@ -302,21 +310,25 @@ def _get_workspace_schedule(
         _cache_revalidate(cache_key, build_live, _SCHEDULE_CACHE_TTL)
         return cached
 
-    # Cold cache.
-    if snap_rows and today > utc_today:
+    # Cold cache — sending-schedules is itself one cheap call, so build live
+    # directly. Far-future snapshot-only days stay on Supabase.
+    if (
+        snap_rows
+        and today > utc_today
+        and send_schedule.relative_schedule_day(today) is None
+    ):
         payload = _build_future_from_snapshot(ws, today, snap_rows)
         _cache_set(cache_key, payload, _SCHEDULE_CACHE_TTL)
         return payload
 
-    if snap_rows:
-        # Instant response, then exact live remaining in the background.
-        payload = _build_fast_from_snapshot(ws, today, snap_rows)
-        _cache_set(cache_key, payload, _SCHEDULE_CACHE_TTL)
-        _cache_revalidate(cache_key, build_live, _SCHEDULE_CACHE_TTL)
-        return payload
-
-    # No snapshot — must page live (slow). Still cache the result.
-    payload = build_live()
+    try:
+        payload = build_live()
+    except Exception as e:
+        logger.warning(f"cold schedule build failed for {ws['id']}: {e}")
+        if snap_rows:
+            payload = _build_fast_from_snapshot(ws, today, snap_rows)
+        else:
+            raise
     _cache_set(cache_key, payload, _SCHEDULE_CACHE_TTL)
     return payload
 
@@ -326,9 +338,10 @@ def schedule_today(workspace_id: Optional[str] = None, date: Optional[str] = Non
     """Sending schedule for one UTC send day, per campaign and per inbox.
 
     Defaults to the current UTC day; pass `date` (YYYY-MM-DD) for another day.
-    Current/past days with a midnight snapshot return a fast estimate first
-    (approximate=true); a background job replaces the cache with exact live
-    remaining (excludes overdue). Future days with a pre-capture are instant.
+    Remaining uses Bison's /campaigns/sending-schedules aggregate
+    (emails_being_sent) for today/tomorrow/day_after_tomorrow — one call per
+    workspace. Midnight snapshot supplies plan_total; workspace chart stats
+    supply sent_total.
 
     Each workspace is cached ~10 minutes independently. Omitting workspace_id
     (or passing "all") sums those same cached entries, so all == v1 + v2.

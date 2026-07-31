@@ -1,7 +1,48 @@
-"""Unit tests for /schedule/today merge helpers."""
+"""Unit tests for /schedule/today merge helpers and sending-schedules mapping."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
+
 from api.routers.schedule import _merge_live_with_snapshot, _merge_workspaces
+from lib.send_schedule import relative_schedule_day, plan_from_sending_schedules
+
+
+def test_relative_schedule_day_maps_three_day_window():
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    assert relative_schedule_day("2026-08-01", now) == "today"
+    assert relative_schedule_day("2026-08-02", now) == "tomorrow"
+    assert relative_schedule_day("2026-08-03", now) == "day_after_tomorrow"
+    assert relative_schedule_day("2026-07-31", now) is None
+    assert relative_schedule_day("2026-08-04", now) is None
+
+
+def test_plan_from_sending_schedules_maps_emails_being_sent():
+    ws = {"id": "ws_v2", "name": "Ottit V2"}
+    client = MagicMock()
+    client.get_sending_schedules.return_value = [
+        {
+            "emails_being_sent": 5341,
+            "campaign_id": 10,
+            "campaign": {"id": 10, "name": "A"},
+        },
+        {
+            "emails_being_sent": 0,
+            "campaign_id": 11,
+            "campaign": {"id": 11, "name": "Drained"},
+        },
+    ]
+    with patch("lib.send_schedule.emailbison.for_workspace", return_value=client), patch(
+        "lib.send_schedule.relative_schedule_day", return_value="today"
+    ):
+        rows = plan_from_sending_schedules(ws, "2026-08-01")
+
+    assert rows is not None
+    assert len(rows) == 1
+    assert rows[0]["planned_today"] == 5341
+    assert rows[0]["campaign_id"] == "10"
+    assert rows[0]["source"] == "sending_schedules"
+    client.get_sending_schedules.assert_called_once_with("today")
 
 
 def test_merge_live_with_snapshot_uses_live_remaining():
