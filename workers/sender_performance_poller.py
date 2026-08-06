@@ -16,6 +16,7 @@ from lib.config import DEFAULT_WORKSPACE_ID, pollable_workspaces
 from lib.supabase_client import get_supabase
 from lib.supabase_paginate import fetch_all
 from lib.utils import get_active_campaign_ids, get_active_campaign_ids_from_bison
+from lib.warmup_report import persist_warmup_daily_report
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +336,15 @@ def poll_sender_email_performance(
             logger.info(f"[{workspace_id}] Batch-upserted {len(rows)} sender performance rows")
         except Exception as e:
             logger.error(f"Failed to batch-upsert sender performance: {e}")
+            return
+
+        # Fleet warmup snapshot for GET /warmup/report (historical dates).
+        try:
+            persist_warmup_daily_report(
+                workspace_id, today, rows=rows, supabase=supabase
+            )
+        except Exception as e:
+            logger.error(f"[{workspace_id}] Failed to persist warmup_daily_report: {e}")
 
 
 def run() -> None:

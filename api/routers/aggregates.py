@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from lib import emailbison, emailguard, config  # noqa: F401
 from lib.supabase_client import get_supabase
 from lib.supabase_paginate import fetch_all
+from lib.warmup_report import get_warmup_report
 from api.logging_utils import log_action
 from lib.notifications import create_notification
 from api.deps import (  # noqa: F401
@@ -593,6 +594,25 @@ class WorkspaceQuota(BaseModel):
     pct_used: Optional[float] = None
     plan_tier: str
     upgrade_url: str
+
+
+@router.get("/warmup/report", dependencies=[Security(require_api_key)])
+def warmup_report(
+    workspace_id: Optional[str] = None,
+    date: Optional[str] = None,
+):
+    """Slack-style warmup fleet report.
+
+    Buckets: not warming, ≥95, 90–94, <90. Optional workspace_id (omit/all =
+    V1+V2 aggregate). Today is computed live from sender_email_performance;
+    historical dates serve warmup_daily_report snapshots.
+    """
+    if date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=422, detail="date must be YYYY-MM-DD")
+    return get_warmup_report(workspace_id=workspace_id, date=date)
 
 
 @router.get("/workspaces/me", dependencies=[Security(require_api_key)], response_model=WorkspaceMe)

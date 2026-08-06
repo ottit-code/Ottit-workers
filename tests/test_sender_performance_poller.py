@@ -12,6 +12,15 @@ from workers.sender_performance_poller import (
 _MODULE = "workers.sender_performance_poller"
 
 
+def _perf_upsert_rows(sb):
+    """First list upsert is sender_email_performance (warmup report upserts a dict)."""
+    for call in sb.table.return_value.upsert.call_args_list:
+        payload = call[0][0]
+        if isinstance(payload, list):
+            return payload
+    raise AssertionError("No list upsert found (sender_email_performance)")
+
+
 def _mock_bison(accounts=None, side_effect=None):
     """Mock BisonClient — the poller resolves clients via for_workspace(),
     so module-level function patches never intercept its calls."""
@@ -108,7 +117,7 @@ class TestPollSenderEmailPerformance:
         ):
             poll_sender_email_performance()
 
-        rows = sb.table.return_value.upsert.call_args[0][0]
+        rows = _perf_upsert_rows(sb)
         assert len(rows) == 1  # Deduplicated across 2 campaigns
         row = rows[0]
         assert row["sender_email_id"] == 1
@@ -128,7 +137,7 @@ class TestPollSenderEmailPerformance:
         ):
             poll_sender_email_performance()
 
-        row = sb.table.return_value.upsert.call_args[0][0][0]
+        row = _perf_upsert_rows(sb)[0]
         # reply_rate = unique_replied / leads_contacted * 100
         assert row["reply_rate"] == pytest.approx(80 / 900 * 100, rel=1e-3)
         # bounce_rate = bounced / emails_sent * 100
@@ -146,8 +155,25 @@ class TestPollSenderEmailPerformance:
         ):
             poll_sender_email_performance()
 
-        row = sb.table.return_value.upsert.call_args[0][0][0]
+        row = _perf_upsert_rows(sb)[0]
         assert row["domain"] == "mycompany.io"
+
+    def test_persists_warmup_daily_report_after_performance(self):
+        sb = self._make_supabase()
+        account = self._make_account()
+
+        with (
+            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
+            patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
+            patch(f"{_MODULE}.get_supabase", return_value=sb),
+            patch(f"{_MODULE}.persist_warmup_daily_report") as persist,
+        ):
+            poll_sender_email_performance()
+
+        persist.assert_called_once()
+        assert persist.call_args.args[0] == "ws_v1"
+        assert isinstance(persist.call_args.kwargs["rows"], list)
+        assert len(persist.call_args.kwargs["rows"]) == 1
 
     def test_skips_accounts_without_id(self):
         sb = self._make_supabase()
@@ -189,7 +215,8 @@ class TestPollSenderEmailPerformance:
         ):
             poll_sender_email_performance()
 
-        sb.table.return_value.upsert.assert_called_once()
+        # Performance batch upsert still happened despite the bad campaign.
+        assert len(_perf_upsert_rows(sb)) == 1
 
 
 class TestRun:
