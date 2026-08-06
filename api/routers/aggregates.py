@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from lib import emailbison, emailguard, config  # noqa: F401
 from lib.supabase_client import get_supabase
 from lib.supabase_paginate import fetch_all
-from lib.warmup_report import get_warmup_report
+from lib.warmup_report import get_warmup_report, list_available_dates
 from api.logging_utils import log_action
 from lib.notifications import create_notification
 from api.deps import (  # noqa: F401
@@ -601,9 +601,11 @@ def warmup_report(
     workspace_id: Optional[str] = None,
     date: Optional[str] = None,
 ):
-    """Slack-style warmup fleet report.
+    """Slack / bison-reports style warmup fleet report.
 
-    Buckets: not warming, ≥95, 90–94, <90. Optional workspace_id (omit/all =
+    Buckets: not warming, not connected, ≥95, 90–94, <90, never warmed.
+    Includes below-threshold + not-warming lists, per-tag health, fleet
+    averages, and previous-day deltas. Optional workspace_id (omit/all =
     V1+V2 aggregate). Today is computed live from sender_email_performance;
     historical dates serve warmup_daily_report snapshots.
     """
@@ -613,6 +615,13 @@ def warmup_report(
         except ValueError:
             raise HTTPException(status_code=422, detail="date must be YYYY-MM-DD")
     return get_warmup_report(workspace_id=workspace_id, date=date)
+
+
+@router.get("/warmup/report/dates", dependencies=[Security(require_api_key)])
+def warmup_report_dates(workspace_id: Optional[str] = None):
+    """Archive dates for the warmup day picker (newest first, ~90 days)."""
+    days = list_available_dates(workspace_id=workspace_id)
+    return {"days": days, "generated": days[0]["date"] if days else None}
 
 
 @router.get("/workspaces/me", dependencies=[Security(require_api_key)], response_model=WorkspaceMe)
