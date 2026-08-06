@@ -41,6 +41,27 @@ def _int_score(value) -> int | None:
         return None
 
 
+def _int_counter(value) -> int | None:
+    """Coerce Bison warmup counters; None stays None (unknown / missing)."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _warmup_counters(w: dict) -> dict:
+    """Map EmailBison /api/warmup/sender-emails fields → DB column names."""
+    return {
+        "warmup_sent": _int_counter(w.get("warmup_emails_sent")),
+        "warmup_replied": _int_counter(w.get("warmup_replies_received")),
+        "warmup_saved_from_spam": _int_counter(w.get("warmup_emails_saved_from_spam")),
+        "warmup_bounces_received": _int_counter(w.get("warmup_bounces_received_count")),
+        "warmup_bounces_caused": _int_counter(w.get("warmup_bounces_caused_count")),
+    }
+
+
 def _fetch_live_warmup(bison: emailbison.BisonClient) -> dict[int, dict]:
     """Live warmup data per sender id from Bison's /api/warmup/sender-emails."""
     try:
@@ -110,6 +131,12 @@ def _fetch_sender_lookup_data(
     lookup: dict[int, dict] = {
         sid: {
             "warmup_score": None,
+            "warmup_sent": None,
+            "warmup_replied": None,
+            "warmup_saved_from_spam": None,
+            "warmup_bounces_received": None,
+            "warmup_bounces_caused": None,
+            "warmup_tags": None,
             "policy_key": None,
             "strike_count": None,
             "next_action_at": None,
@@ -120,10 +147,13 @@ def _fetch_sender_lookup_data(
         for sid in sender_ids
     }
 
-    # Warmup score: prefer live Bison data, fall back to recorded history.
+    # Warmup score + counters: prefer live Bison data, fall back to history for score.
     for sid, w in (live_warmup or {}).items():
         if sid in lookup:
             lookup[sid]["warmup_score"] = w.get("warmup_score")
+            lookup[sid].update(_warmup_counters(w))
+            if w.get("tags") is not None:
+                lookup[sid]["warmup_tags"] = w.get("tags")
 
     missing_warmup = [sid for sid in sender_ids if lookup[sid]["warmup_score"] is None]
     if missing_warmup:
@@ -294,6 +324,11 @@ def poll_sender_email_performance(
         reply_rate = _safe_rate(unique_replied, contacts)
         bounce_rate = _safe_rate(bounced, emails_sent)
 
+        # Prefer warmup-endpoint tags (set tags); fall back to campaign account tags.
+        tags = db.get("warmup_tags")
+        if tags is None:
+            tags = account.get("tags")
+
         rows.append({
             "workspace_id": workspace_id,
             "sender_email_id": sid,
@@ -317,6 +352,11 @@ def poll_sender_email_performance(
             "bounce_rate": bounce_rate,
             "interest_rate": _safe_rate(interested, contacts),
             "warmup_score": db.get("warmup_score"),
+            "warmup_sent": db.get("warmup_sent"),
+            "warmup_replied": db.get("warmup_replied"),
+            "warmup_saved_from_spam": db.get("warmup_saved_from_spam"),
+            "warmup_bounces_received": db.get("warmup_bounces_received"),
+            "warmup_bounces_caused": db.get("warmup_bounces_caused"),
             "in_recovery": db.get("in_recovery", False),
             "recovery_policy_key": db.get("policy_key"),
             "recovery_strike_count": db.get("strike_count"),
@@ -324,21 +364,52 @@ def poll_sender_email_performance(
             "latest_placement_score": db.get("placement_score"),
             "latest_spam_score": db.get("spam_score"),
             "health_score": _compute_health_score(supabase, reply_rate, bounce_rate, db),
-            "tags": account.get("tags"),
+            "tags": tags,
             "fetched_at": fetched_at,
         })
 
     if rows:
+        upsert_ok = False
         try:
             supabase.table("sender_email_performance").upsert(
                 rows, on_conflict="workspace_id,sender_email_id,snapshot_date"
             ).execute()
             logger.info(f"[{workspace_id}] Batch-upserted {len(rows)} sender performance rows")
+            upsert_ok = True
         except Exception as e:
-            logger.error(f"Failed to batch-upsert sender performance: {e}")
+            # Migration 018 may not be applied yet — retry without counter cols.
+            msg = str(e).lower()
+            counter_keys = (
+                "warmup_sent",
+                "warmup_replied",
+                "warmup_saved_from_spam",
+                "warmup_bounces_received",
+                "warmup_bounces_caused",
+            )
+            if any(k in msg for k in counter_keys) or "column" in msg:
+                stripped = [
+                    {k: v for k, v in r.items() if k not in counter_keys} for r in rows
+                ]
+                try:
+                    supabase.table("sender_email_performance").upsert(
+                        stripped,
+                        on_conflict="workspace_id,sender_email_id,snapshot_date",
+                    ).execute()
+                    logger.warning(
+                        f"[{workspace_id}] Upserted performance without warmup "
+                        f"counters (apply migration 018): {e}"
+                    )
+                    upsert_ok = True
+                except Exception as e2:
+                    logger.error(f"Failed to batch-upsert sender performance: {e2}")
+            else:
+                logger.error(f"Failed to batch-upsert sender performance: {e}")
+
+        if not upsert_ok:
             return
 
         # Fleet warmup snapshot for GET /warmup/report (historical dates).
+        # Keep full in-memory rows (incl. counters) for the JSON payload.
         try:
             persist_warmup_daily_report(
                 workspace_id, today, rows=rows, supabase=supabase

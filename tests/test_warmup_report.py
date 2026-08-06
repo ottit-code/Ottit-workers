@@ -2,11 +2,13 @@
 from unittest.mock import MagicMock, patch
 
 from lib.warmup_report import (
+    build_correlation_series,
     build_report_from_rows,
     get_warmup_report,
     normalize_tags,
     normalize_workspace_id,
     persist_warmup_daily_report,
+    primary_set_tag,
 )
 
 
@@ -20,8 +22,12 @@ def _row(
     tags=None,
     workspace_id="ws_v1",
     connection_status="Connected",
+    warmup_sent=None,
+    warmup_saved_from_spam=None,
+    warmup_bounces_caused=None,
+    warmup_bounces_received=None,
 ):
-    return {
+    row = {
         "workspace_id": workspace_id,
         "sender_email_id": sid,
         "sender_email": email or f"s{sid}@{domain}",
@@ -31,6 +37,15 @@ def _row(
         "tags": tags if tags is not None else [],
         "connection_status": connection_status,
     }
+    if warmup_sent is not None:
+        row["warmup_sent"] = warmup_sent
+    if warmup_saved_from_spam is not None:
+        row["warmup_saved_from_spam"] = warmup_saved_from_spam
+    if warmup_bounces_caused is not None:
+        row["warmup_bounces_caused"] = warmup_bounces_caused
+    if warmup_bounces_received is not None:
+        row["warmup_bounces_received"] = warmup_bounces_received
+    return row
 
 
 class TestNormalizeTags:
@@ -336,3 +351,140 @@ class TestPersistAndGet:
         assert t1["total"] == 3
         assert t1["score_95_plus"] == 2
         assert t1["score_below_90"] == 1
+
+
+class TestAccountFieldMapping:
+    def test_account_rows_include_bison_parity_fields(self):
+        rows = [
+            _row(
+                1,
+                score=40,
+                tags=["CI-DED-SET1", "p.CI-DED-SET1"],
+                warmup_sent=3,
+                warmup_saved_from_spam=2,
+                warmup_bounces_caused=1,
+                warmup_bounces_received=0,
+            ),
+            _row(2, enabled=False, score=99, tags=["Alpha"], warmup_sent=50),
+            _row(3, score=0, tags=[], warmup_sent=0),
+        ]
+        report = build_report_from_rows(
+            rows, report_date="2026-08-06", workspace_id="ws_v1"
+        )
+        below = report["below_threshold"][0]
+        assert below["email"] == "s1@ex.com"
+        assert below["warmup_score"] == 40
+        assert below["score"] == 40
+        assert below["warmup_sent"] == 3
+        assert below["spam_saves"] == 2
+        assert below["set"] == "CI-DED-SET1"
+        assert below["tags"] == ["CI-DED-SET1"]
+        assert below["bounces_caused"] == 1
+        assert below["bounces_received"] == 0
+
+        nw = report["not_warming_accounts"][0]
+        assert nw["warmup_sent"] == 50
+        assert nw["set"] == "Alpha"
+        assert nw["score"] == 99
+
+        never = report["never_warmed_accounts"][0]
+        assert never["warmup_sent"] == 0
+        assert never["set"] is None
+
+    def test_never_warmed_uses_warmup_sent_zero(self):
+        """Enabled + warmup_sent == 0 is never_warmed even if score looks live."""
+        rows = [
+            _row(1, score=88, warmup_sent=0),  # never warmed by sends
+            _row(2, score=0, warmup_sent=None),  # fallback: score == 0
+            _row(3, score=88, warmup_sent=5),  # below 90, actively warming
+        ]
+        report = build_report_from_rows(
+            rows, report_date="2026-08-06", workspace_id="ws_v1"
+        )
+        assert report["never_warmed"] == 2
+        assert report["score_below_90"] == 1
+        assert {a["sender_email_id"] for a in report["never_warmed_accounts"]} == {
+            "1",
+            "2",
+        }
+        assert report["below_threshold"][0]["sender_email_id"] == "3"
+        assert report["below_threshold"][0]["warmup_sent"] == 5
+
+    def test_primary_set_tag(self):
+        assert primary_set_tag(["CI-DED-Set4", "extra"]) == "CI-DED-Set4"
+        assert primary_set_tag([]) is None
+
+
+class TestCorrelationSeries:
+    def test_joins_warmup_and_reply_stats_by_date(self):
+        warmup = [
+            {
+                "report_date": "2026-08-01",
+                "total_accounts": 100,
+                "score_95_plus": 80,
+                "avg_warmup_score": 96.5,
+            },
+            {
+                "report_date": "2026-08-02",
+                "total_accounts": 100,
+                "score_95_plus": 90,
+                "payload": {
+                    "stats": {"avg_score_active": 97.1, "avg_score_all": 96.0}
+                },
+            },
+        ]
+        stats = [
+            {"stat_date": "2026-08-01", "emails_sent": 1000, "emails_replied": 50},
+            {"stat_date": "2026-08-02", "emails_sent": 2000, "emails_replied": 80},
+            {"stat_date": "2026-08-03", "emails_sent": 500, "emails_replied": 10},
+        ]
+        series = build_correlation_series(warmup, stats)
+        assert [p["date"] for p in series] == [
+            "2026-08-01",
+            "2026-08-02",
+            "2026-08-03",
+        ]
+        d1 = series[0]
+        assert d1["avg_warmup_score"] == 96.5
+        assert d1["pct_95_plus"] == 80.0
+        assert d1["emails_sent"] == 1000
+        assert d1["replies"] == 50
+        assert d1["reply_rate"] == 5.0
+
+        d2 = series[1]
+        assert d2["avg_warmup_score"] == 97.1
+        assert d2["pct_95_plus"] == 90.0
+        assert d2["reply_rate"] == 4.0
+
+        d3 = series[2]
+        assert d3["avg_warmup_score"] is None
+        assert d3["pct_95_plus"] is None
+        assert d3["reply_rate"] == 2.0
+
+    def test_aggregates_multi_workspace_rows(self):
+        warmup = [
+            {
+                "report_date": "2026-08-01",
+                "total_accounts": 50,
+                "score_95_plus": 40,
+                "avg_warmup_score": 95.0,
+            },
+            {
+                "report_date": "2026-08-01",
+                "total_accounts": 50,
+                "score_95_plus": 50,
+                "avg_warmup_score": 99.0,
+            },
+        ]
+        stats = [
+            {"stat_date": "2026-08-01", "emails_sent": 100, "emails_replied": 10},
+            {"stat_date": "2026-08-01", "emails_sent": 300, "emails_replied": 30},
+        ]
+        series = build_correlation_series(warmup, stats)
+        assert len(series) == 1
+        p = series[0]
+        assert p["pct_95_plus"] == 90.0  # 90/100
+        assert p["avg_warmup_score"] == 97.0  # (95*50 + 99*50) / 100
+        assert p["emails_sent"] == 400
+        assert p["replies"] == 40
+        assert p["reply_rate"] == 10.0

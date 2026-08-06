@@ -21,7 +21,11 @@ from pydantic import BaseModel, Field
 from lib import emailbison, emailguard, config  # noqa: F401
 from lib.supabase_client import get_supabase
 from lib.supabase_paginate import fetch_all
-from lib.warmup_report import get_warmup_report, list_available_dates
+from lib.warmup_report import (
+    get_warmup_correlation,
+    get_warmup_report,
+    list_available_dates,
+)
 from api.logging_utils import log_action
 from lib.notifications import create_notification
 from api.deps import (  # noqa: F401
@@ -622,6 +626,22 @@ def warmup_report_dates(workspace_id: Optional[str] = None):
     """Archive dates for the warmup day picker (newest first, ~90 days)."""
     days = list_available_dates(workspace_id=workspace_id)
     return {"days": days, "generated": days[0]["date"] if days else None}
+
+
+@router.get("/warmup/correlation", dependencies=[Security(require_api_key)])
+def warmup_correlation(
+    workspace_id: Optional[str] = None,
+    days: int = 30,
+):
+    """Warmup fleet health vs workspace reply rate over time.
+
+    Joins daily warmup_daily_report (avg score, pct 95+) with
+    workspace_daily_stats (emails_sent, replies / reply_rate).
+    Optional workspace_id (omit/all = aggregate). Default days=30 (max 365).
+    """
+    if days < 1 or days > 365:
+        raise HTTPException(status_code=422, detail="days must be 1–365")
+    return get_warmup_correlation(workspace_id=workspace_id, days=days)
 
 
 @router.get("/workspaces/me", dependencies=[Security(require_api_key)], response_model=WorkspaceMe)

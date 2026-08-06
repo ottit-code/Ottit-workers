@@ -8,13 +8,14 @@ Bucket semantics (match Saman's Bison Report Bot / bison-reports.vercel.app):
   - score_95_plus:  score >= 95
   - score_90_to_94: 90 <= score < 95
   - score_below_90: 0 < score < 90
-  - never_warmed: score == 0 (warming but zero warmup history)
+  - never_warmed: enabled but warmup_sent == 0 (or score == 0 when
+    counters unavailable — zero warmup history)
 - Enabled but unscored accounts stay in total_accounts only.
   Percentages are each count / total_accounts.
 
 Also surfaces: not-warming / never-warmed account lists, below-threshold
-rows, per-tag (set) health, fleet averages, previous-day deltas, and
-available archive dates.
+rows (with warmup_sent / spam_saves / set), per-tag (set) health, fleet
+averages, previous-day deltas, archive dates, and warmup↔reply correlation.
 
 Internal Bison tags containing "p." are stripped (same rule as senders/notifier).
 """
@@ -30,6 +31,13 @@ from lib.supabase_paginate import fetch_all
 logger = logging.getLogger(__name__)
 
 _PERF_COLS = (
+    "workspace_id,sender_email_id,sender_email,domain,"
+    "warmup_enabled,warmup_score,tags,connection_status,"
+    "warmup_sent,warmup_replied,warmup_saved_from_spam,"
+    "warmup_bounces_received,warmup_bounces_caused"
+)
+# Pre-migration 018 select — used if new counter columns are missing.
+_PERF_COLS_LEGACY = (
     "workspace_id,sender_email_id,sender_email,domain,"
     "warmup_enabled,warmup_score,tags,connection_status"
 )
@@ -98,8 +106,62 @@ def _parse_score(score: Any) -> Optional[float]:
         return None
 
 
-def _score_bucket(score: Any) -> Optional[str]:
-    """Map a numeric score to a bucket key, or None if unscored."""
+def _parse_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _warmup_sent(row: dict) -> Optional[int]:
+    """Warmup emails sent — DB column or raw Bison field name."""
+    for key in ("warmup_sent", "warmup_emails_sent"):
+        if key in row and row.get(key) is not None:
+            return _parse_int(row.get(key))
+    return None
+
+
+def _spam_saves(row: dict) -> Optional[int]:
+    for key in ("warmup_saved_from_spam", "warmup_emails_saved_from_spam", "spam_saves"):
+        if key in row and row.get(key) is not None:
+            return _parse_int(row.get(key))
+    return None
+
+
+def _bounces_caused(row: dict) -> Optional[int]:
+    for key in ("warmup_bounces_caused", "warmup_bounces_caused_count", "bounces_caused"):
+        if key in row and row.get(key) is not None:
+            return _parse_int(row.get(key))
+    return None
+
+
+def _bounces_received(row: dict) -> Optional[int]:
+    for key in ("warmup_bounces_received", "warmup_bounces_received_count", "bounces_received"):
+        if key in row and row.get(key) is not None:
+            return _parse_int(row.get(key))
+    return None
+
+
+def primary_set_tag(tags: list[str]) -> Optional[str]:
+    """Primary Bison set tag (first cleaned tag), or None if untagged."""
+    return tags[0] if tags else None
+
+
+def _is_never_warmed(row: dict, score: Any) -> bool:
+    """Warming but zero warmup sends (bison-reports), else score == 0 fallback."""
+    sent = _warmup_sent(row)
+    if sent is not None:
+        return sent == 0
+    s = _parse_score(score)
+    return s is not None and s == 0
+
+
+def _score_bucket(score: Any, row: Optional[dict] = None) -> Optional[str]:
+    """Map a numeric score (+ optional warmup_sent) to a bucket key."""
+    if row is not None and _is_never_warmed(row, score):
+        return "never_warmed"
     s = _parse_score(score)
     if s is None:
         return None
@@ -128,7 +190,13 @@ def _account_row(row: dict, tags: list[str], score_out: Optional[float]) -> dict
         "email": email,
         "domain": domain,
         "warmup_score": score_out,
+        "score": score_out,
+        "warmup_sent": _warmup_sent(row),
+        "spam_saves": _spam_saves(row),
+        "set": primary_set_tag(tags),
         "tags": tags,
+        "bounces_caused": _bounces_caused(row),
+        "bounces_received": _bounces_received(row),
         "connection_status": row.get("connection_status"),
     }
 
@@ -139,6 +207,14 @@ def _score_out(score: Any) -> Optional[float]:
         return None
     # Preserve one decimal when present; ints stay ints via round trip.
     return round(s, 2) if s != int(s) else int(s)
+
+
+def _has_warmup_activity(row: dict, parsed: Optional[float]) -> bool:
+    """True when the account has produced warmup sends (active cohort)."""
+    sent = _warmup_sent(row)
+    if sent is not None:
+        return sent > 0
+    return parsed is not None and parsed > 0
 
 
 def build_report_from_rows(
@@ -185,12 +261,14 @@ def build_report_from_rows(
             account_bucket = "not_warming"
             not_warming_accounts.append(_account_row(row, tags, score_out))
         else:
-            bucket = _score_bucket(score)
+            bucket = _score_bucket(score, row)
             if bucket:
                 counts[bucket] += 1
             account_bucket = bucket  # may be None if enabled+unscored
 
-            if parsed is not None and parsed > 0:
+            # Active = has warmup sends (bison-reports "avg active");
+            # fall back to score > 0 when counters unavailable.
+            if _has_warmup_activity(row, parsed) and parsed is not None:
                 active_scores.append(parsed)
                 if parsed >= 100:
                     perfect_100 += 1
@@ -317,21 +395,37 @@ def fetch_performance_rows(
     sb = supabase or get_supabase()
     ws = normalize_workspace_id(workspace_id)
 
-    def _query():
-        q = (
-            sb.table("sender_email_performance")
-            .select(_PERF_COLS)
-            .eq("snapshot_date", report_date)
-            .order("workspace_id")
-            .order("sender_email_id")
-        )
-        if ws:
-            q = q.eq("workspace_id", ws)
-        return q
+    def _query(cols: str):
+        def _inner():
+            q = (
+                sb.table("sender_email_performance")
+                .select(cols)
+                .eq("snapshot_date", report_date)
+                .order("workspace_id")
+                .order("sender_email_id")
+            )
+            if ws:
+                q = q.eq("workspace_id", ws)
+            return q
+        return _inner
 
     try:
-        return fetch_all(_query)
+        return fetch_all(_query(_PERF_COLS))
     except Exception as e:
+        # Migration 018 may not be applied yet — retry without counter cols.
+        msg = str(e).lower()
+        if "warmup_sent" in msg or "warmup_saved" in msg or "warmup_bounces" in msg or "column" in msg:
+            try:
+                logger.warning(
+                    f"sender_email_performance missing warmup counters — "
+                    f"using legacy select ({e})"
+                )
+                return fetch_all(_query(_PERF_COLS_LEGACY))
+            except Exception as e2:
+                logger.error(
+                    f"Failed to fetch sender_email_performance for {report_date}: {e2}"
+                )
+                return []
         logger.error(f"Failed to fetch sender_email_performance for {report_date}: {e}")
         return []
 
@@ -848,3 +942,190 @@ def list_available_dates(
         by_date[today] = {"date": today}
 
     return sorted(by_date.values(), key=lambda d: d["date"], reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Warmup ↔ reply correlation
+# ---------------------------------------------------------------------------
+
+
+def build_correlation_series(
+    warmup_rows: list[dict],
+    stats_rows: list[dict],
+) -> list[dict]:
+    """Join daily warmup fleet metrics with workspace reply stats.
+
+    Pure function — no I/O. Each input row is already aggregated for one date
+    (or will be merged by date here when multiple workspace rows share a date).
+
+    warmup_rows keys: date/report_date, avg_warmup_score, pct_95_plus
+      (or total_accounts + score_95_plus + payload.stats for snapshots)
+    stats_rows keys: date/stat_date, emails_sent, emails_replied
+    """
+    warmup_by_date: dict[str, dict] = {}
+    for r in warmup_rows:
+        d = str(r.get("date") or r.get("report_date") or "")
+        if not d:
+            continue
+        cur = warmup_by_date.setdefault(
+            d,
+            {
+                "total_accounts": 0,
+                "score_95_plus": 0,
+                "_score_sum": 0.0,
+                "_score_n": 0,
+            },
+        )
+        total = int(r.get("total_accounts") or 0)
+        score_95 = int(r.get("score_95_plus") or 0)
+        cur["total_accounts"] += total
+        cur["score_95_plus"] += score_95
+
+        avg = r.get("avg_warmup_score")
+        if avg is None:
+            payload = r.get("payload") or {}
+            if isinstance(payload, str):
+                import json
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            stats = payload.get("stats") or r.get("stats") or {}
+            avg = stats.get("avg_score_active")
+            if avg is None:
+                avg = stats.get("avg_score_all")
+        if avg is not None and total:
+            cur["_score_sum"] += float(avg) * total
+            cur["_score_n"] += total
+        elif avg is not None and r.get("avg_warmup_score") is not None:
+            # Pre-aggregated single-day point without total weight.
+            cur["_score_sum"] += float(avg)
+            cur["_score_n"] += 1
+
+        if r.get("pct_95_plus") is not None and total == 0 and cur["total_accounts"] == 0:
+            # Pre-baked pct from a pure series point.
+            cur["pct_95_plus"] = float(r["pct_95_plus"])
+
+    stats_by_date: dict[str, dict] = {}
+    for r in stats_rows:
+        d = str(r.get("date") or r.get("stat_date") or "")
+        if not d:
+            continue
+        cur = stats_by_date.setdefault(d, {"emails_sent": 0, "emails_replied": 0})
+        cur["emails_sent"] += int(r.get("emails_sent") or 0)
+        cur["emails_replied"] += int(r.get("emails_replied") or 0)
+        if r.get("replies") is not None and not r.get("emails_replied"):
+            cur["emails_replied"] += int(r.get("replies") or 0)
+
+    dates = sorted(set(warmup_by_date) | set(stats_by_date))
+    series: list[dict] = []
+    for d in dates:
+        w = warmup_by_date.get(d) or {}
+        s = stats_by_date.get(d) or {}
+        total = int(w.get("total_accounts") or 0)
+        score_95 = int(w.get("score_95_plus") or 0)
+        if "pct_95_plus" in w and total == 0:
+            pct_95 = round(float(w["pct_95_plus"]), 2)
+        else:
+            pct_95 = _pct(score_95, total) if total else None
+
+        n_scores = int(w.get("_score_n") or 0)
+        avg_score = (
+            round(float(w["_score_sum"]) / n_scores, 2) if n_scores else None
+        )
+
+        sent = int(s.get("emails_sent") or 0)
+        replies = int(s.get("emails_replied") or 0)
+        reply_rate = round((replies / sent) * 100, 4) if sent else None
+
+        series.append(
+            {
+                "date": d,
+                "avg_warmup_score": avg_score,
+                "pct_95_plus": pct_95,
+                "reply_rate": reply_rate,
+                "replies": replies,
+                "emails_sent": sent,
+            }
+        )
+    return series
+
+
+def get_warmup_correlation(
+    workspace_id: Optional[str] = None,
+    days: int = 30,
+    supabase=None,
+) -> dict:
+    """Daily warmup fleet metrics joined with workspace reply rates.
+
+    Reads warmup_daily_report (pct 95+, avg score) and workspace_daily_stats
+    (emails_sent / emails_replied) over the last `days` calendar days.
+    """
+    sb = supabase or get_supabase()
+    days = max(1, min(int(days or 30), 365))
+    ws = normalize_workspace_id(workspace_id)
+    today = datetime.now(timezone.utc).date()
+    since = (today - timedelta(days=days - 1)).isoformat()
+
+    warmup_rows: list[dict] = []
+    try:
+        q = (
+            sb.table("warmup_daily_report")
+            .select(
+                "workspace_id,report_date,total_accounts,score_95_plus,payload"
+            )
+            .gte("report_date", since)
+            .order("report_date")
+        )
+        if ws:
+            q = q.eq("workspace_id", ws)
+        warmup_rows = q.execute().data or []
+    except Exception as e:
+        logger.warning(f"warmup_daily_report correlation fetch failed: {e}")
+
+    stats_rows: list[dict] = []
+    try:
+        q = (
+            sb.table("workspace_daily_stats")
+            .select("workspace_id,stat_date,emails_sent,emails_replied")
+            .gte("stat_date", since)
+            .order("stat_date")
+        )
+        if ws:
+            q = q.eq("workspace_id", ws)
+        stats_rows = q.execute().data or []
+    except Exception as e:
+        logger.warning(f"workspace_daily_stats correlation fetch failed: {e}")
+
+    # Include today's live warmup point when today's snapshot is missing.
+    today_s = today.isoformat()
+    has_today_warmup = any(
+        str(r.get("report_date")) == today_s for r in warmup_rows
+    )
+    if not has_today_warmup:
+        try:
+            live = get_warmup_report(workspace_id=ws, date=today_s, supabase=sb)
+            if (live.get("total_accounts") or 0) > 0:
+                stats = live.get("stats") or {}
+                warmup_rows.append(
+                    {
+                        "report_date": today_s,
+                        "total_accounts": live.get("total_accounts") or 0,
+                        "score_95_plus": live.get("score_95_plus") or 0,
+                        "avg_warmup_score": stats.get("avg_score_active")
+                        if stats.get("avg_score_active") is not None
+                        else stats.get("avg_score_all"),
+                        "payload": {"stats": stats},
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"live warmup correlation point failed: {e}")
+
+    series = build_correlation_series(warmup_rows, stats_rows)
+    return {
+        "workspace_id": ws,
+        "days": days,
+        "since": since,
+        "until": today_s,
+        "series": series,
+    }

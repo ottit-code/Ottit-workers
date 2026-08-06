@@ -5,6 +5,7 @@ import pytest
 from workers.sender_performance_poller import (
     _safe_rate,
     _fetch_sender_lookup_data,
+    _warmup_counters,
     poll_sender_email_performance,
     run,
 )
@@ -38,6 +39,34 @@ class TestSafeRate:
 
     def test_zero_denominator(self):
         assert _safe_rate(5, 0) == 0.0
+
+
+class TestWarmupCounters:
+    def test_maps_bison_warmup_fields(self):
+        mapped = _warmup_counters({
+            "warmup_emails_sent": 108,
+            "warmup_replies_received": 12,
+            "warmup_emails_saved_from_spam": 24,
+            "warmup_bounces_received_count": 1,
+            "warmup_bounces_caused_count": 2,
+            "warmup_score": 77.78,
+        })
+        assert mapped == {
+            "warmup_sent": 108,
+            "warmup_replied": 12,
+            "warmup_saved_from_spam": 24,
+            "warmup_bounces_received": 1,
+            "warmup_bounces_caused": 2,
+        }
+
+    def test_missing_fields_stay_none(self):
+        assert _warmup_counters({}) == {
+            "warmup_sent": None,
+            "warmup_replied": None,
+            "warmup_saved_from_spam": None,
+            "warmup_bounces_received": None,
+            "warmup_bounces_caused": None,
+        }
 
 
 class TestFetchSenderLookupData:
@@ -174,6 +203,43 @@ class TestPollSenderEmailPerformance:
         assert persist.call_args.args[0] == "ws_v1"
         assert isinstance(persist.call_args.kwargs["rows"], list)
         assert len(persist.call_args.kwargs["rows"]) == 1
+
+    def test_persists_live_warmup_counters_on_performance_row(self):
+        sb = self._make_supabase()
+        account = self._make_account(sender_id=42)
+        bison = _mock_bison([account])
+        bison.get_warmup_sender_emails.return_value = [
+            {
+                "id": 42,
+                "email": "s@example.com",
+                "domain": "example.com",
+                "tags": ["CI-DED-SET1"],
+                "warmup_emails_sent": 108,
+                "warmup_replies_received": 12,
+                "warmup_emails_saved_from_spam": 24,
+                "warmup_score": 77.8,
+                "warmup_bounces_received_count": 0,
+                "warmup_bounces_caused_count": 1,
+            }
+        ]
+
+        with (
+            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
+            patch("lib.emailbison.for_workspace", return_value=bison),
+            patch(f"{_MODULE}.get_supabase", return_value=sb),
+            patch(f"{_MODULE}._record_warmup_history"),
+            patch(f"{_MODULE}.persist_warmup_daily_report"),
+        ):
+            poll_sender_email_performance()
+
+        row = _perf_upsert_rows(sb)[0]
+        assert row["warmup_score"] == 78  # rounded int
+        assert row["warmup_sent"] == 108
+        assert row["warmup_replied"] == 12
+        assert row["warmup_saved_from_spam"] == 24
+        assert row["warmup_bounces_received"] == 0
+        assert row["warmup_bounces_caused"] == 1
+        assert row["tags"] == ["CI-DED-SET1"]
 
     def test_skips_accounts_without_id(self):
         sb = self._make_supabase()
