@@ -57,3 +57,5 @@ cp .env.example .env  # fill in Supabase + Anthropic + OpenAI keys
 uvicorn api.main:app --reload
 pytest -q
 ```
+
+<!-- Redeploy trigger: 2026-08-06 -->
