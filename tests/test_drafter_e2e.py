@@ -214,10 +214,11 @@ def test_drafter_inbound_idempotent(client, fixture_payload, patches):
     assert second.json()["draft_id"] == first.json()["draft_id"]
 
 
-def test_drafter_inbound_rejects_missing_auth(client, fixture_payload):
-    # No auth header
+def test_drafter_inbound_allows_missing_auth(client, fixture_payload, patches):
+    """n8n may forward without Authorization; missing header must not 401."""
     resp = client.post("/webhooks/bison/lead-interested", json=fixture_payload)
-    assert resp.status_code == 401
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["bison_reply_uuid"] == "31a04c41-1bf6-4dab-a0a8-bb2a90b89195"
 
 
 def test_drafter_inbound_rejects_bad_auth(client, fixture_payload):
@@ -227,3 +228,19 @@ def test_drafter_inbound_rejects_bad_auth(client, fixture_payload):
         json=fixture_payload,
     )
     assert resp.status_code == 401
+
+
+def test_drafter_inbound_accepts_n8n_alias_and_wrapper(client, fixture_payload, patches):
+    """n8n often forwards the whole Webhook item; alias path unwraps it."""
+    wrapped = {
+        "headers": {"x-forwarded-for": "1.2.3.4"},
+        "params": {},
+        "query": {},
+        "body": fixture_payload,
+    }
+    resp = client.post(
+        "/webhooks/n8n/lead-interested",
+        json=wrapped,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["bison_reply_uuid"] == "31a04c41-1bf6-4dab-a0a8-bb2a90b89195"

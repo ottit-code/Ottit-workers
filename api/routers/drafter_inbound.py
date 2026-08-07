@@ -1,23 +1,25 @@
 """
-POST /webhooks/bison/lead-interested — n8n forwards the raw Bison
+POST /webhooks/bison/lead-interested — n8n forwards the Bison
 LEAD_INTERESTED payload here. We draft synchronously and return the draft
 in the HTTP response.
 
+Also available as POST /webhooks/n8n/lead-interested (same handler).
+
 Typical latency 5–15 s. Hard cap is `DRAFT_TIMEOUT_SECONDS`.
 
-Auth: Bearer DRAFTER_API_KEY.
+Auth: optional. If Authorization is sent, must be Bearer DRAFTER_API_KEY.
 """
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Security
+from fastapi import APIRouter, Body, HTTPException, Security
 from pydantic import BaseModel, Field
 
 from api.routers.drafter_deps import require_drafter_key
 from lib import drafter
-from models.bison_payload import BisonEventEnvelope
+from lib.n8n_payload import parse_bison_envelope
 from models.drafts import ConfidenceComponents, SlackPayload
 
 logger = logging.getLogger(__name__)
@@ -56,12 +58,8 @@ class DraftResponse(BaseModel):
     )
 
 
-@router.post(
-    "/webhooks/bison/lead-interested",
-    response_model=DraftResponse,
-    dependencies=[Security(require_drafter_key)],
-)
-def lead_interested(envelope: BisonEventEnvelope) -> DraftResponse:
+def _run_drafter(raw_body: Any) -> DraftResponse:
+    envelope = parse_bison_envelope(raw_body)
     payload = envelope.data
     try:
         result = drafter.run(payload)
@@ -91,3 +89,19 @@ def lead_interested(envelope: BisonEventEnvelope) -> DraftResponse:
         slack=result.slack,
         clean_prospect_reply=result.clean_prospect_reply,
     )
+
+
+@router.post(
+    "/webhooks/bison/lead-interested",
+    response_model=DraftResponse,
+    dependencies=[Security(require_drafter_key)],
+)
+@router.post(
+    "/webhooks/n8n/lead-interested",
+    response_model=DraftResponse,
+    dependencies=[Security(require_drafter_key)],
+    include_in_schema=True,
+)
+def lead_interested(body: Any = Body(...)) -> DraftResponse:
+    """Accept raw Bison envelope or common n8n-wrapped shapes."""
+    return _run_drafter(body)

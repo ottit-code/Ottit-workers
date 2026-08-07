@@ -20,6 +20,7 @@ from lib import config
 
 from api.routers.drafter_inbound import router as drafter_inbound_router
 from api.routers.drafter_admin import router as drafter_admin_router
+from api.routers.inboxassure_spamcheck import router as inboxassure_spamcheck_router
 from api.routers.health import router as health_router
 from api.routers.stats import router as stats_router
 from api.routers.senders import router as senders_router
@@ -78,6 +79,7 @@ async def _handle_unexpected_error(request: Request, exc: Exception):
 for _router in (
     drafter_inbound_router,
     drafter_admin_router,
+    inboxassure_spamcheck_router,
     health_router,
     stats_router,
     senders_router,

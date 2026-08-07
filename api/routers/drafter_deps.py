@@ -10,17 +10,22 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 def require_drafter_key(creds: HTTPAuthorizationCredentials = Security(_bearer)) -> None:
-    """Auth for the inbound webhook from n8n.
+    """Optional auth for inbound webhooks (n8n / Bison forwards).
 
-    Fail-closed: a missing DRAFTER_API_KEY only bypasses auth in development
-    (APP_ENV=development); otherwise it returns 503 so prod can't go open.
+    Missing Authorization is allowed so n8n can POST without a header.
+    If Authorization is sent, it must be Bearer DRAFTER_API_KEY.
+
+    When DRAFTER_API_KEY is unset: open in development; 503 otherwise
+    (so prod cannot silently go open while still accepting forged Bearer tokens).
     """
     if not config.DRAFTER_API_KEY:
         if config.APP_ENV == "development":
             return
         raise HTTPException(status_code=503, detail="DRAFTER_API_KEY not configured")
-    if creds is None or creds.credentials != config.DRAFTER_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing drafter API key")
+    if creds is None:
+        return
+    if creds.credentials != config.DRAFTER_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid drafter API key")
 
 
 def require_admin_key(creds: HTTPAuthorizationCredentials = Security(_bearer)) -> None:
