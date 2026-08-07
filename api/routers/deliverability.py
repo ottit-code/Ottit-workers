@@ -325,6 +325,64 @@ def list_inboxassure_results(
     return {"configured": inboxassure.is_configured(), "results": rows}
 
 
+# ---------------------------------------------------------------------------
+# InboxAssure spamcheck.completed runs — ingested via n8n webhook
+# (POST /webhooks/inboxassure/spamcheck-completed). Distinct from the
+# placement-test poller above.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/deliverability/inboxassure/spamchecks",
+    dependencies=[Security(require_api_key)],
+)
+def list_inboxassure_spamchecks(
+    workspace_id: Optional[str] = None,
+    limit: int = 50,
+):
+    """List recent spamcheck runs. Scoped by workspace_id when provided."""
+    from lib.inboxassure_spamcheck import list_spamchecks
+
+    try:
+        runs = list_spamchecks(workspace_id=workspace_id, limit=limit)
+    except Exception as e:
+        # Table missing (migration 019 not applied) — empty list for the UI.
+        logger.warning(f"inboxassure_spamchecks list failed: {e}")
+        runs = []
+    return {"spamchecks": runs}
+
+
+@router.get(
+    "/deliverability/inboxassure/spamchecks/{ia_spamcheck_id}",
+    dependencies=[Security(require_api_key)],
+)
+def get_inboxassure_spamcheck(
+    ia_spamcheck_id: int,
+    workspace_id: Optional[str] = None,
+):
+    """One spamcheck run with per-account reports.
+
+    Optional workspace_id enforces that the run belongs to the selected
+    workspace (404 otherwise). Omit/all skips that check.
+    """
+    from lib.inboxassure_spamcheck import get_spamcheck
+
+    try:
+        run = get_spamcheck(ia_spamcheck_id)
+    except Exception as e:
+        logger.warning(f"inboxassure_spamchecks get failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load spamcheck") from e
+
+    if not run:
+        raise HTTPException(status_code=404, detail="Spamcheck not found")
+
+    ws = workspace_id if workspace_id and workspace_id != "all" else None
+    if ws and run.get("workspace_id") and run["workspace_id"] != ws:
+        raise HTTPException(status_code=404, detail="Spamcheck not found")
+
+    return run
+
+
 _SURBL_COLS = "eg_check_uuid,domain,status,listed,triggered_by,created_at,completed_at"
 
 

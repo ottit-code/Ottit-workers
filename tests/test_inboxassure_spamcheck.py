@@ -205,3 +205,123 @@ def test_endpoint_accepts_valid_auth(client):
             json=FIXTURE,
         )
     assert resp.status_code == 200, resp.text
+
+
+def test_list_spamchecks_scopes_workspace():
+    from lib.inboxassure_spamcheck import list_spamchecks
+
+    class _Query:
+        def __init__(self):
+            self.filters = {}
+
+        def select(self, *_a, **_k):
+            return self
+
+        def order(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
+            return self
+
+        def eq(self, key, value):
+            self.filters[key] = value
+            return self
+
+        def execute(self):
+            return MagicMock(data=[{"ia_spamcheck_id": 1, "workspace_id": "ws_v2"}])
+
+    q = _Query()
+    sb = MagicMock()
+    sb.table.return_value = q
+
+    with patch("lib.inboxassure_spamcheck.get_supabase", return_value=sb):
+        rows = list_spamchecks(workspace_id="ws_v2", limit=10)
+
+    assert rows[0]["ia_spamcheck_id"] == 1
+    assert q.filters["workspace_id"] == "ws_v2"
+
+
+def test_get_spamcheck_includes_reports():
+    from lib.inboxassure_spamcheck import get_spamcheck
+
+    parent = {
+        "ia_spamcheck_id": 1179,
+        "name": "Ottit: SM-GOOG-SET3-0609: MWF Check",
+        "workspace_id": "ws_v2",
+    }
+    reports = [
+        {"id": "a", "email_account": "a@x.com", "is_good": True},
+        {"id": "b", "email_account": "b@x.com", "is_good": False},
+    ]
+
+    class _ParentQ:
+        def select(self, *_a, **_k):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
+            return self
+
+        def execute(self):
+            return MagicMock(data=[parent])
+
+    class _ReportQ:
+        def select(self, *_a, **_k):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        def order(self, *_a, **_k):
+            return self
+
+        def execute(self):
+            return MagicMock(data=reports)
+
+    sb = MagicMock()
+    sb.table.side_effect = lambda name: (
+        _ParentQ() if name == "inboxassure_spamchecks" else _ReportQ()
+    )
+
+    with patch("lib.inboxassure_spamcheck.get_supabase", return_value=sb):
+        run = get_spamcheck(1179)
+
+    assert run is not None
+    assert run["ia_spamcheck_id"] == 1179
+    assert len(run["reports"]) == 2
+
+
+def test_list_spamchecks_endpoint(client):
+    with patch(
+        "lib.inboxassure_spamcheck.list_spamchecks",
+        return_value=[
+            {
+                "ia_spamcheck_id": 1179,
+                "name": "Ottit: SM-GOOG-SET3-0609: MWF Check",
+                "status": "completed",
+                "workspace_id": "ws_v2",
+            }
+        ],
+    ):
+        resp = client.get(
+            "/deliverability/inboxassure/spamchecks?workspace_id=ws_v2",
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["spamchecks"][0]["ia_spamcheck_id"] == 1179
+
+
+def test_get_spamcheck_endpoint_workspace_mismatch(client):
+    with patch(
+        "lib.inboxassure_spamcheck.get_spamcheck",
+        return_value={
+            "ia_spamcheck_id": 1179,
+            "workspace_id": "ws_v2",
+            "reports": [],
+        },
+    ):
+        resp = client.get(
+            "/deliverability/inboxassure/spamchecks/1179?workspace_id=ws_v1",
+        )
+    assert resp.status_code == 404

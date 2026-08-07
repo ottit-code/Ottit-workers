@@ -224,3 +224,85 @@ def ingest_spamcheck_webhook(
     """Full path: unwrap → validate → resolve workspace → upsert."""
     body = parse_spamcheck_payload(raw)
     return upsert_spamcheck(body, workspace_id_override=workspace_id_override)
+
+
+# ---------------------------------------------------------------------------
+# Read helpers (dashboard)
+# ---------------------------------------------------------------------------
+
+_SPAMCHECK_LIST_COLS = (
+    "ia_spamcheck_id,name,status,subject,conditions,"
+    "ia_created_at,ia_updated_at,"
+    "total_accounts,good_accounts,bad_accounts,"
+    "good_accounts_percentage,bad_accounts_percentage,"
+    "average_google_score,average_outlook_score,"
+    "total_bounced,total_unique_replies,total_emails_sent,"
+    "workspace_id,workspace_name,received_at,updated_at"
+)
+
+_SPAMCHECK_REPORT_COLS = (
+    "id,ia_spamcheck_id,email_account,"
+    "google_pro_score,outlook_pro_score,is_good,sending_limit,"
+    "tags_list,workspace_name,bounced_count,unique_replied_count,"
+    "emails_sent_count,ia_created_at"
+)
+
+
+def _normalize_workspace_filter(workspace_id: Optional[str]) -> Optional[str]:
+    """None/'all' → no filter; otherwise return the workspace id."""
+    if workspace_id and workspace_id != "all":
+        return workspace_id
+    return None
+
+
+def list_spamchecks(
+    *,
+    workspace_id: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Latest spamcheck runs, newest first. Workspace-scoped when provided."""
+    if limit < 1:
+        limit = 1
+    if limit > 200:
+        limit = 200
+
+    ws = _normalize_workspace_filter(workspace_id)
+    query = (
+        get_supabase()
+        .table("inboxassure_spamchecks")
+        .select(_SPAMCHECK_LIST_COLS)
+        .order("ia_updated_at", desc=True)
+        .limit(limit)
+    )
+    if ws:
+        query = query.eq("workspace_id", ws)
+    return query.execute().data or []
+
+
+def get_spamcheck(ia_spamcheck_id: int) -> Optional[dict]:
+    """One spamcheck run plus its per-account reports, or None if missing."""
+    sb = get_supabase()
+    parent_rows = (
+        sb.table("inboxassure_spamchecks")
+        .select(_SPAMCHECK_LIST_COLS)
+        .eq("ia_spamcheck_id", ia_spamcheck_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not parent_rows:
+        return None
+
+    reports = (
+        sb.table("inboxassure_spamcheck_reports")
+        .select(_SPAMCHECK_REPORT_COLS)
+        .eq("ia_spamcheck_id", ia_spamcheck_id)
+        .order("email_account")
+        .execute()
+        .data
+        or []
+    )
+    run = dict(parent_rows[0])
+    run["reports"] = reports
+    return run
