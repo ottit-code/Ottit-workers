@@ -819,6 +819,36 @@ def _compute_report_for_date(
     return _merge_reports(parts, report_date=report_date, source="snapshot")
 
 
+def _count_fleet_senders(
+    report_date: str,
+    workspace_id: Optional[str],
+    supabase,
+) -> Optional[int]:
+    """Count sender_daily_stats rows for the same day/workspace (full fleet).
+
+    Used as an N-of-M diagnostic against the performance-snapshot total.
+    """
+    ws = normalize_workspace_id(workspace_id)
+    try:
+        def _query():
+            q = (
+                supabase.table("sender_daily_stats")
+                .select("workspace_id,sender_email_id")
+                .eq("stat_date", report_date)
+                .order("workspace_id")
+                .order("sender_email_id")
+            )
+            if ws:
+                q = q.eq("workspace_id", ws)
+            return q
+
+        rows = fetch_all(_query)
+        return len({(r.get("workspace_id"), r.get("sender_email_id")) for r in rows})
+    except Exception as e:
+        logger.warning(f"fleet_total count failed for {report_date}: {e}")
+        return None
+
+
 def get_warmup_report(
     workspace_id: Optional[str] = None,
     date: Optional[str] = None,
@@ -845,6 +875,14 @@ def get_warmup_report(
         logger.warning(f"Failed to attach previous-day warmup delta: {e}")
         report["previous"] = None
         report["delta"] = None
+
+    fleet_total = _count_fleet_senders(report_date, workspace_id, sb)
+    report["fleet_total"] = fleet_total
+    report["scope"] = (
+        "all_workspaces"
+        if normalize_workspace_id(workspace_id) is None
+        else "workspace"
+    )
 
     return report
 

@@ -22,10 +22,13 @@ def _perf_upsert_rows(sb):
     raise AssertionError("No list upsert found (sender_email_performance)")
 
 
-def _mock_bison(accounts=None, side_effect=None):
+def _mock_bison(accounts=None, side_effect=None, senders=None):
     """Mock BisonClient — the poller resolves clients via for_workspace(),
     so module-level function patches never intercept its calls."""
     client = MagicMock()
+    fleet = senders if senders is not None else (accounts or [])
+    client.get_sender_emails.return_value = fleet
+    client.get_warmup_sender_emails.return_value = []
     if side_effect is not None:
         client.get_campaign_email_accounts.side_effect = side_effect
     else:
@@ -138,16 +141,20 @@ class TestPollSenderEmailPerformance:
     def test_upserts_one_row_per_unique_sender(self):
         sb = self._make_supabase()
         account = self._make_account()
+        # Fleet has the sender once; campaign overlay may list it twice.
+        bison = _mock_bison(accounts=[account], senders=[account])
+        bison.get_campaign_email_accounts.side_effect = None
+        bison.get_campaign_email_accounts.return_value = [account]
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1", "c2"]),
-            patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["c1", "c2"]),
+            patch("lib.emailbison.for_workspace", return_value=bison),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_sender_email_performance()
 
         rows = _perf_upsert_rows(sb)
-        assert len(rows) == 1  # Deduplicated across 2 campaigns
+        assert len(rows) == 1  # Deduplicated across fleet + campaigns
         row = rows[0]
         assert row["sender_email_id"] == 1
         assert row["sender_email"] == "s@example.com"
@@ -160,7 +167,7 @@ class TestPollSenderEmailPerformance:
         account = self._make_account()
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["c1"]),
             patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
@@ -178,7 +185,7 @@ class TestPollSenderEmailPerformance:
         account.pop("domain", None)
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["c1"]),
             patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
@@ -192,7 +199,7 @@ class TestPollSenderEmailPerformance:
         account = self._make_account()
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["c1"]),
             patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
             patch(f"{_MODULE}.persist_warmup_daily_report") as persist,
@@ -224,7 +231,7 @@ class TestPollSenderEmailPerformance:
         ]
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["c1"]),
             patch("lib.emailbison.for_workspace", return_value=bison),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
             patch(f"{_MODULE}._record_warmup_history"),
@@ -247,23 +254,41 @@ class TestPollSenderEmailPerformance:
         account["id"] = None
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["c1"]),
-            patch("lib.emailbison.for_workspace", return_value=_mock_bison([account])),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=[]),
+            patch("lib.emailbison.for_workspace", return_value=_mock_bison(senders=[account])),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_sender_email_performance()
 
         sb.table.return_value.upsert.assert_not_called()
 
-    def test_no_campaigns_does_nothing(self):
+    def test_no_senders_does_nothing(self):
         sb = self._make_supabase()
+        bison = _mock_bison(senders=[])
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=[]),
+            patch("lib.emailbison.for_workspace", return_value=bison),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_sender_email_performance()
 
         sb.table.return_value.upsert.assert_not_called()
+
+    def test_includes_fleet_senders_without_campaigns(self):
+        """Warmup undercount fix: fleet senders not on active campaigns still snapshot."""
+        sb = self._make_supabase()
+        account = self._make_account(sender_id=99, email="idle@example.com")
+        bison = _mock_bison(senders=[account], accounts=[])
+        with (
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=[]),
+            patch("lib.emailbison.for_workspace", return_value=bison),
+            patch(f"{_MODULE}.get_supabase", return_value=sb),
+            patch(f"{_MODULE}.persist_warmup_daily_report"),
+        ):
+            poll_sender_email_performance()
+
+        rows = _perf_upsert_rows(sb)
+        assert len(rows) == 1
+        assert rows[0]["sender_email_id"] == 99
 
     def test_continues_on_campaign_api_error(self):
         sb = self._make_supabase()
@@ -275,8 +300,11 @@ class TestPollSenderEmailPerformance:
             return [account]
 
         with (
-            patch(f"{_MODULE}.get_active_campaign_ids", return_value=["good", "bad"]),
-            patch("lib.emailbison.for_workspace", return_value=_mock_bison(side_effect=side_effect)),
+            patch(f"{_MODULE}.get_active_campaign_ids_from_bison", return_value=["good", "bad"]),
+            patch(
+                "lib.emailbison.for_workspace",
+                return_value=_mock_bison(senders=[account], side_effect=side_effect),
+            ),
             patch(f"{_MODULE}.get_supabase", return_value=sb),
         ):
             poll_sender_email_performance()

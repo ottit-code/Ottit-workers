@@ -1,8 +1,9 @@
 """
 sender_performance_poller.py — runs daily at 1 AM
 
-Fetches sender performance data from EmailBison campaigns, cross-references
-deliverability and recovery data from Supabase, and upserts into:
+Fetches the full sender fleet from EmailBison (/api/sender-emails), merges live
+warmup + optional campaign-account engagement metrics, cross-references
+deliverability/recovery data from Supabase, and upserts into:
 - sender_email_performance: per-sender daily snapshot with health score
 """
 
@@ -12,10 +13,10 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from lib import emailbison
-from lib.config import DEFAULT_WORKSPACE_ID, pollable_workspaces
+from lib.config import pollable_workspaces
 from lib.supabase_client import get_supabase
 from lib.supabase_paginate import fetch_all
-from lib.utils import get_active_campaign_ids, get_active_campaign_ids_from_bison
+from lib.utils import get_active_campaign_ids_from_bison
 from lib.warmup_report import persist_warmup_daily_report
 
 logger = logging.getLogger(__name__)
@@ -260,23 +261,18 @@ def _compute_health_score(supabase, reply_rate: float, bounce_rate: float, db: d
     return None
 
 
-def poll_sender_email_performance(
-    workspace_id: str = DEFAULT_WORKSPACE_ID,
-    bison: emailbison.BisonClient | None = None,
-) -> None:
-    """Fetch email accounts for all active campaigns, deduplicate, and upsert performance rows."""
-    supabase = get_supabase()
-    today = _today()
-    bison = bison or emailbison.for_workspace(workspace_id)
-    # Always use the live Bison campaign list — the Supabase document copy
-    # goes stale and yields 404s for deleted campaigns (and misses new ones).
-    campaign_ids = get_active_campaign_ids_from_bison(bison)
-    if not campaign_ids and workspace_id == DEFAULT_WORKSPACE_ID:
-        campaign_ids = get_active_campaign_ids(supabase)
-    logger.info(f"[{workspace_id}] Polling sender performance across {len(campaign_ids)} campaigns")
+def _campaign_account_overlay(
+    bison: emailbison.BisonClient,
+) -> dict[int, dict]:
+    """Optional engagement metrics from active campaign sender-email lists.
 
-    # Collect unique senders across all campaigns
-    senders_by_id: dict[int, dict] = {}
+    Membership for the performance snapshot is the full /sender-emails fleet;
+    campaign accounts often carry richer unique-reply counters we merge in.
+    """
+    campaign_ids = get_active_campaign_ids_from_bison(bison)
+    if not campaign_ids:
+        return {}
+    overlay: dict[int, dict] = {}
     for campaign_id in campaign_ids:
         try:
             accounts = bison.get_campaign_email_accounts(campaign_id)
@@ -285,23 +281,84 @@ def poll_sender_email_performance(
                 if sid is None:
                     continue
                 sid = int(sid)
-                if sid not in senders_by_id:
-                    senders_by_id[sid] = account
+                if sid not in overlay:
+                    overlay[sid] = account
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                logger.warning(f"Campaign {campaign_id} not found (404) — may have been deleted from EmailBison")
+                logger.warning(
+                    f"Campaign {campaign_id} not found (404) — may have been deleted from EmailBison"
+                )
             else:
-                logger.error(f"Failed to fetch email accounts for campaign {campaign_id}: {e}")
+                logger.error(
+                    f"Failed to fetch email accounts for campaign {campaign_id}: {e}"
+                )
         except Exception as e:
-            logger.error(f"Failed to fetch email accounts for campaign {campaign_id}: {e}")
+            logger.error(
+                f"Failed to fetch email accounts for campaign {campaign_id}: {e}"
+            )
+    return overlay
 
-    if not senders_by_id:
-        logger.info("No senders found across active campaigns")
+
+def _merge_sender_metrics(base: dict, overlay: dict | None) -> dict:
+    """Prefer campaign-account engagement fields when present; keep fleet identity."""
+    if not overlay:
+        return base
+    merged = dict(base)
+    for key in (
+        "total_leads_contacted_count",
+        "emails_sent_count",
+        "total_replied_count",
+        "total_opened_count",
+        "unique_replied_count",
+        "unique_opened_count",
+        "unsubscribed_count",
+        "bounced_count",
+        "interested_leads_count",
+        "type",
+        "status",
+        "warmup_enabled",
+        "tags",
+        "domain",
+    ):
+        if overlay.get(key) is not None:
+            merged[key] = overlay.get(key)
+    return merged
+
+
+def poll_sender_email_performance(
+    workspace_id: str = "ws_v1",
+    bison: emailbison.BisonClient | None = None,
+) -> None:
+    """Snapshot performance for the full sender fleet (not campaign-attached only)."""
+    supabase = get_supabase()
+    today = _today()
+    bison = bison or emailbison.for_workspace(workspace_id)
+
+    # Full fleet — same universe as stats_poller / Senders page.
+    try:
+        fleet = bison.get_sender_emails()
+    except Exception as e:
+        logger.error(f"[{workspace_id}] Failed to fetch sender emails: {e}")
         return
 
-    sender_ids = list(senders_by_id.keys())
-    logger.info(f"Computing performance for {len(sender_ids)} unique senders")
+    senders_by_id: dict[int, dict] = {}
+    for account in fleet:
+        sid = account.get("id")
+        if sid is None:
+            continue
+        senders_by_id[int(sid)] = account
 
+    if not senders_by_id:
+        logger.info(f"[{workspace_id}] No senders from /api/sender-emails")
+        return
+
+    campaign_overlay = _campaign_account_overlay(bison)
+    logger.info(
+        f"[{workspace_id}] Polling sender performance for {len(senders_by_id)} "
+        f"fleet senders ({len(campaign_overlay)} with campaign metrics)"
+    )
+
+    sender_ids = list(senders_by_id.keys())
     live_warmup = _fetch_live_warmup(bison)
     _record_warmup_history(supabase, live_warmup)
     lookup = _fetch_sender_lookup_data(supabase, sender_ids, live_warmup)
@@ -309,25 +366,42 @@ def poll_sender_email_performance(
     fetched_at = datetime.now(timezone.utc).isoformat()
     rows: list[dict] = []
 
-    for sid, account in senders_by_id.items():
+    for sid, base_account in senders_by_id.items():
+        account = _merge_sender_metrics(base_account, campaign_overlay.get(sid))
         db = lookup.get(sid, {})
         email = account.get("email") or ""
         domain = email.split("@")[1] if "@" in email else (account.get("domain") or "")
 
         contacts = int(account.get("total_leads_contacted_count") or 0)
         emails_sent = int(account.get("emails_sent_count") or 0)
-        unique_replied = int(account.get("unique_replied_count") or 0)
-        unique_opened = int(account.get("unique_opened_count") or 0)
+        unique_replied = int(
+            account.get("unique_replied_count")
+            if account.get("unique_replied_count") is not None
+            else account.get("total_replied_count")
+            or 0
+        )
+        unique_opened = int(
+            account.get("unique_opened_count")
+            if account.get("unique_opened_count") is not None
+            else account.get("total_opened_count")
+            or 0
+        )
         bounced = int(account.get("bounced_count") or 0)
         interested = int(account.get("interested_leads_count") or 0)
 
-        reply_rate = _safe_rate(unique_replied, contacts)
+        # Reply rate: prefer contacted denominator; fall back to emails sent.
+        reply_denom = contacts or emails_sent
+        reply_rate = _safe_rate(unique_replied, reply_denom)
         bounce_rate = _safe_rate(bounced, emails_sent)
 
-        # Prefer warmup-endpoint tags (set tags); fall back to campaign account tags.
+        # Prefer warmup-endpoint tags (set tags); fall back to sender/campaign tags.
         tags = db.get("warmup_tags")
         if tags is None:
             tags = account.get("tags")
+
+        warmup_enabled = account.get("warmup_enabled")
+        if sid in live_warmup and live_warmup[sid].get("warmup_enabled") is not None:
+            warmup_enabled = live_warmup[sid].get("warmup_enabled")
 
         rows.append({
             "workspace_id": workspace_id,
@@ -337,7 +411,7 @@ def poll_sender_email_performance(
             "domain": domain,
             "connection_type": account.get("type"),
             "connection_status": account.get("status"),
-            "warmup_enabled": bool(account.get("warmup_enabled", False)),
+            "warmup_enabled": bool(warmup_enabled),
             "emails_sent_count": emails_sent,
             "total_leads_contacted_count": contacts,
             "total_replied_count": int(account.get("total_replied_count") or 0),
@@ -348,9 +422,9 @@ def poll_sender_email_performance(
             "bounced_count": bounced,
             "interested_leads_count": interested,
             "reply_rate": reply_rate,
-            "open_rate": _safe_rate(unique_opened, contacts),
+            "open_rate": _safe_rate(unique_opened, reply_denom),
             "bounce_rate": bounce_rate,
-            "interest_rate": _safe_rate(interested, contacts),
+            "interest_rate": _safe_rate(interested, reply_denom),
             "warmup_score": db.get("warmup_score"),
             "warmup_sent": db.get("warmup_sent"),
             "warmup_replied": db.get("warmup_replied"),
@@ -416,6 +490,7 @@ def poll_sender_email_performance(
             )
         except Exception as e:
             logger.error(f"[{workspace_id}] Failed to persist warmup_daily_report: {e}")
+
 
 
 def run() -> None:
