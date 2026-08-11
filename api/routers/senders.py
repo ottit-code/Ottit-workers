@@ -651,3 +651,111 @@ def get_sender_performance_history(sender_email_id: int, days: int = 30):
         raise
 
 
+# ---------------------------------------------------------------------------
+# Daily limits — capacity staging payload for the dashboard UI
+# ---------------------------------------------------------------------------
+
+def _prior_day_stats_map(ws_filter: Optional[str], today: str) -> dict[tuple, dict]:
+    """Yesterday's (or most recent prior) emails_sent per sender for deltas."""
+    try:
+        today_d = datetime.fromisoformat(today).date()
+    except ValueError:
+        today_d = datetime.now(timezone.utc).date()
+    prior_date = (today_d - timedelta(days=1)).isoformat()
+    try:
+        def build():
+            query = (
+                get_supabase()
+                .table("sender_daily_stats")
+                .select("workspace_id,sender_email_id,emails_sent,stat_date")
+                .lt("stat_date", today)
+                .gte("stat_date", (today_d - timedelta(days=7)).isoformat())
+                .order("sender_email_id")
+                .order("stat_date", desc=True)
+            )
+            if ws_filter:
+                query = query.eq("workspace_id", ws_filter)
+            return query
+
+        rows = fetch_all(build)
+    except Exception as e:
+        logger.warning(f"prior day stats lookup failed: {e}")
+        return {}
+
+    out: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r.get("workspace_id"), r.get("sender_email_id"))
+        if key not in out:
+            out[key] = r
+    # Prefer exact yesterday when present (already first due to desc order).
+    _ = prior_date
+    return out
+
+
+@router.get("/senders/daily-limits", dependencies=[Security(require_api_key)])
+def sender_daily_limits(workspace_id: Optional[str] = None):
+    """Fleet daily-limit capacity view: senders, tags, KPIs, Set 1–6 bundles.
+
+    Built from the latest sender_daily_stats + tags from sender_email_performance.
+    `sent_today` is a cumulative delta vs the prior snapshot (same as notifier).
+    """
+    from lib.daily_limits import (
+        build_bundles,
+        compute_kpis,
+        normalize_sender_row,
+        tag_counts,
+    )
+
+    ws_filter = _ws(workspace_id)
+    today = _today()
+    supabase = get_supabase()
+
+    def build_today():
+        query = (
+            supabase.table("sender_daily_stats")
+            .select(_SENDER_STATS_COLS)
+            .eq("stat_date", today)
+            .order("sender_email")
+        )
+        if ws_filter:
+            query = query.eq("workspace_id", ws_filter)
+        return query
+
+    try:
+        rows = fetch_all(build_today)
+        if not rows:
+            params: dict = {}
+            if ws_filter:
+                params["p_workspace_id"] = ws_filter
+            rows = fetch_all(lambda: supabase.rpc("get_latest_sender_stats", params))
+    except Exception:
+        raise
+
+    prior = _prior_day_stats_map(ws_filter, today)
+    perf_map = _latest_perf_map()
+
+    senders: list[dict] = []
+    for row in rows or []:
+        sid = row.get("sender_email_id")
+        perf = perf_map.get(int(sid), {}) if sid is not None else {}
+        row = dict(row)
+        row["tags"] = perf.get("tags", [])
+        key = (row.get("workspace_id"), sid)
+        prev = prior.get(key)
+        if prev is None:
+            sent_today = None
+        else:
+            sent_today = max(
+                (row.get("emails_sent") or 0) - (prev.get("emails_sent") or 0), 0
+            )
+        senders.append(normalize_sender_row(row, sent_today=sent_today))
+
+    return {
+        "kpis": compute_kpis(senders),
+        "tags": tag_counts(senders),
+        "bundles": build_bundles(senders),
+        "senders": senders,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+

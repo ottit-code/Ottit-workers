@@ -404,3 +404,47 @@ def list_surbl_checks(
         raise
 
 
+# ---------------------------------------------------------------------------
+# Zombie heatmap + trends (per-inbox day triples by tag set)
+# ---------------------------------------------------------------------------
+
+_ZOMBIE_CACHE_TTL = 120  # seconds
+
+
+@router.get("/deliverability/zombie", dependencies=[Security(require_api_key)])
+def zombie_report(
+    days: int = 90,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+):
+    """Per-inbox reply heatmap data for Deliverability → Zombie / Trends.
+
+    Returns bison-reports-compatible shape: days, rateBins, countBins, sets
+    (with cells[].d flat day triples), totals, watch, meta. Workspace-scoped
+    via workspace_id (ws_v1 / ws_v2); omit or 'all' aggregates.
+    """
+    from lib.zombie_report import get_zombie_report
+
+    ws = workspace_id if workspace_id and workspace_id != "all" else None
+    cache_key = f"zombie:{ws or 'all'}:{days}:{start_date or ''}:{end_date or ''}"
+
+    def build():
+        try:
+            return get_zombie_report(
+                days=days,
+                start_date=start_date,
+                end_date=end_date,
+                workspace_id=ws,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    payload = build()
+    _cache_set(cache_key, payload, _ZOMBIE_CACHE_TTL)
+    return payload
+
+

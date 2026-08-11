@@ -94,18 +94,186 @@ def duplicate_campaign(campaign_id: str, x_user_email: str = Header(default=None
 # ---------------------------------------------------------------------------
 
 class UpdateDailyLimitRequest(BaseModel):
-    daily_limit: int
+    daily_limit: int = Field(..., ge=0)
+    workspace_id: Optional[str] = None
+
+
+def _bison_for(workspace_id: Optional[str]):
+    """Resolve a workspace-scoped Bison client; default workspace when omitted."""
+    ws = workspace_id or config.DEFAULT_WORKSPACE_ID
+    return emailbison.for_workspace(ws), ws
+
+
+def _sync_daily_limit_snapshot(
+    sender_id: str, daily_limit: int, workspace_id: str
+) -> None:
+    """Best-effort: keep today's sender_daily_stats.daily_limit in sync."""
+    try:
+        get_supabase().table("sender_daily_stats").update(
+            {"daily_limit": daily_limit}
+        ).eq("sender_email_id", int(sender_id)).eq(
+            "workspace_id", workspace_id
+        ).eq("stat_date", _today()).execute()
+    except Exception as e:
+        logger.warning(
+            "daily_limit snapshot sync failed sender=%s ws=%s: %s",
+            sender_id,
+            workspace_id,
+            e,
+        )
 
 
 @router.patch("/actions/senders/{sender_id}/daily-limit", dependencies=[Security(require_api_key)])
-def update_daily_limit(sender_id: str, body: UpdateDailyLimitRequest, x_user_email: str = Header(default=None)):
+def update_daily_limit(
+    sender_id: str,
+    body: UpdateDailyLimitRequest,
+    x_user_email: str = Header(default=None),
+):
+    client, ws = _bison_for(body.workspace_id)
+    payload = {"daily_limit": body.daily_limit, "workspace_id": ws}
     try:
-        result = emailbison.patch(f"/api/sender-emails/{sender_id}", {"daily_limit": body.daily_limit})
-        log_action("sender_update_daily_limit", "sender", sender_id, payload=body.dict(), api_response=result, performed_by=x_user_email)
+        result = client.patch(
+            f"/api/sender-emails/{sender_id}", {"daily_limit": body.daily_limit}
+        )
+        _sync_daily_limit_snapshot(sender_id, body.daily_limit, ws)
+        log_action(
+            "sender_update_daily_limit",
+            "sender",
+            sender_id,
+            payload=payload,
+            api_response=result,
+            performed_by=x_user_email,
+        )
         return {"success": True, "data": result}
     except Exception as e:
-        log_action("sender_update_daily_limit", "sender", sender_id, status="error", error_message=str(e), performed_by=x_user_email)
+        log_action(
+            "sender_update_daily_limit",
+            "sender",
+            sender_id,
+            status="error",
+            error_message=str(e),
+            performed_by=x_user_email,
+            payload=payload,
+        )
         raise
+
+
+class BulkDailyLimitUpdate(BaseModel):
+    sender_email_id: str
+    daily_limit: int = Field(..., ge=0)
+    workspace_id: Optional[str] = None
+
+
+class ApplyDailyLimitsRequest(BaseModel):
+    updates: List[BulkDailyLimitUpdate] = Field(..., min_length=1)
+    workspace_id: Optional[str] = None
+
+
+@router.post("/actions/senders/daily-limits/apply", dependencies=[Security(require_api_key)])
+def apply_daily_limits(
+    body: ApplyDailyLimitsRequest,
+    x_user_email: str = Header(default=None),
+):
+    """Apply staged daily-limit changes to EmailBison (workspace-aware).
+
+    Groups updates by workspace so ws_v1 / ws_v2 each use their own token.
+    Partial failures are returned per sender without aborting the whole batch.
+    """
+    if len(body.updates) > 2000:
+        raise HTTPException(status_code=422, detail="At most 2000 updates per request")
+
+    # Group by workspace
+    by_ws: Dict[str, List[BulkDailyLimitUpdate]] = {}
+    for upd in body.updates:
+        ws = upd.workspace_id or body.workspace_id or config.DEFAULT_WORKSPACE_ID
+        by_ws.setdefault(ws, []).append(upd)
+
+    results: list[dict] = []
+    succeeded = 0
+    failed = 0
+
+    def _one(client, ws_id: str, upd: BulkDailyLimitUpdate) -> dict:
+        sid = str(upd.sender_email_id)
+        try:
+            api_response = client.patch(
+                f"/api/sender-emails/{sid}", {"daily_limit": upd.daily_limit}
+            )
+            _sync_daily_limit_snapshot(sid, upd.daily_limit, ws_id)
+            log_action(
+                "sender_update_daily_limit",
+                "sender",
+                sid,
+                payload={
+                    "daily_limit": upd.daily_limit,
+                    "workspace_id": ws_id,
+                    "bulk": True,
+                },
+                api_response=api_response,
+                performed_by=x_user_email,
+            )
+            return {
+                "sender_email_id": sid,
+                "workspace_id": ws_id,
+                "daily_limit": upd.daily_limit,
+                "ok": True,
+                "error": None,
+            }
+        except Exception as e:
+            log_action(
+                "sender_update_daily_limit",
+                "sender",
+                sid,
+                status="error",
+                error_message=str(e),
+                performed_by=x_user_email,
+                payload={
+                    "daily_limit": upd.daily_limit,
+                    "workspace_id": ws_id,
+                    "bulk": True,
+                },
+            )
+            return {
+                "sender_email_id": sid,
+                "workspace_id": ws_id,
+                "daily_limit": upd.daily_limit,
+                "ok": False,
+                "error": str(e),
+            }
+
+    for ws_id, updates in by_ws.items():
+        try:
+            client = emailbison.for_workspace(ws_id)
+        except Exception as e:
+            for upd in updates:
+                failed += 1
+                results.append(
+                    {
+                        "sender_email_id": str(upd.sender_email_id),
+                        "workspace_id": ws_id,
+                        "daily_limit": upd.daily_limit,
+                        "ok": False,
+                        "error": str(e),
+                    }
+                )
+            continue
+
+        # Modest parallelism — Bison rate-limits hard sequential PATCHes.
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futs = [pool.submit(_one, client, ws_id, upd) for upd in updates]
+            for fut in futs:
+                row = fut.result()
+                results.append(row)
+                if row["ok"]:
+                    succeeded += 1
+                else:
+                    failed += 1
+
+    return {
+        "success": failed == 0,
+        "succeeded": succeeded,
+        "failed": failed,
+        "results": results,
+    }
 
 
 class ToggleWarmupRequest(BaseModel):
