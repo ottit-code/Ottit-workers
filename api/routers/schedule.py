@@ -3,8 +3,12 @@
 GET /schedule/today reports three numbers for the current UTC day:
 - planned:   full day's plan, captured at UTC midnight by send_plan_snapshotter
 - sent:      emails actually sent so far today (live Bison workspace stats)
-- remaining: emails_being_sent from Bison's /campaigns/sending-schedules
-             (one call — same aggregate the product UI uses)
+- remaining: emails still to send for today's plan (drains toward 0)
+             = max(plan - min(sent, plan), 0) when plan + sent are known
+
+Bison's emails_being_sent (sending-schedules) is a schedule-size aggregate
+that does NOT drain like remaining-of-plan — it is only used as a fallback
+when plan/sent are unavailable, and for upcoming days' "queued" counts.
 
 Read-only: never mutates anything on the Bison side.
 
@@ -20,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Security
 
-from lib import config, send_schedule
+from lib import config, plan_progress, send_schedule
 from lib.supabase_client import get_supabase
 from api.deps import require_api_key, _cache_get_stale, _cache_set, _cache_revalidate
 
@@ -51,6 +55,14 @@ def _plan_snapshot(today: str, ws_ids: List[str]) -> Dict[str, List[dict]]:
         return {}
 
 
+def _apply_plan_progress_to_campaigns(campaigns: List[Dict[str, Any]]) -> None:
+    """Overwrite per-campaign LEFT with plan − sent when both are known."""
+    for c in campaigns:
+        left = plan_progress.left_of_plan(c.get("planned_start"), c.get("sent_today"))
+        if left is not None:
+            c["planned_today"] = left
+
+
 def _finalize(
     campaigns: List[Dict[str, Any]],
     *,
@@ -60,8 +72,12 @@ def _finalize(
     generated_at: Optional[str],
     approximate: bool = False,
 ) -> Dict[str, Any]:
+    _apply_plan_progress_to_campaigns(campaigns)
     campaigns = sorted(campaigns, key=lambda c: -c["planned_today"])
-    remaining_total = sum(c["planned_today"] for c in campaigns)
+    queue_sum = sum(int(c.get("planned_today") or 0) for c in campaigns)
+    # Prefer closed identity on workspace totals when plan + sent are known.
+    progress_left = plan_progress.left_of_plan(plan_total, sent_total)
+    remaining_total = progress_left if progress_left is not None else queue_sum
     overdues = [c.get("overdue_today") for c in campaigns]
     overdue_total = (
         sum(o for o in overdues if o is not None)
@@ -137,7 +153,11 @@ def _merge_live_with_snapshot(
 def _build_fast_from_snapshot(
     ws: dict, today: str, snap_rows: List[dict]
 ) -> Dict[str, Any]:
-    """Seconds-fast estimate: remaining ≈ planned - sent (may include overdue)."""
+    """Plan-progress view: LEFT = max(plan − min(sent, plan), 0) per campaign.
+
+    Uses per-campaign chart sent + midnight planned. This is the canonical
+    progress math for the current send day (not an approximate fallback).
+    """
     campaigns = send_schedule.plan_from_snapshot(ws, today, snap_rows)
     plan_total = sum(int(r.get("planned") or 0) for r in snap_rows)
     snapshot_at = None
@@ -151,8 +171,8 @@ def _build_fast_from_snapshot(
         today=today,
         plan_total=plan_total,
         sent_total=sent_total,
-        generated_at=snapshot_at,
-        approximate=True,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        approximate=False,
     )
 
 
@@ -193,11 +213,13 @@ def _build_future_from_snapshot(
 def _build_live(
     ws: dict, today: str, utc_today: str, snap_rows: List[dict]
 ) -> Dict[str, Any]:
-    """Live remaining from Bison's sending-schedules aggregate (one call).
+    """Build live schedule for one workspace/day.
 
-    Falls back to queue paging only when the day is outside Bison's
-    today/tomorrow/day_after_tomorrow window, and to planned−sent when both
-    live paths fail.
+    For the current or past send day with a midnight snapshot, remaining is
+    plan-progress (plan − sent) via per-campaign chart stats — NOT Bison's
+    emails_being_sent, which stays near full-day size and skews LEFT/%.
+
+    Upcoming days still use sending-schedules / queue paging for "queued".
     """
     campaigns: List[Dict[str, Any]] = []
     plan_total: Optional[int] = None
@@ -208,10 +230,13 @@ def _build_live(
             # Far-future day with a pre-capture and no aggregate — Supabase only.
             return _build_future_from_snapshot(ws, today, snap_rows)
 
-        # Preferred: one-call aggregate (real emails_being_sent).
+        # Current/past day with a midnight plan: LEFT = plan − sent (drains).
+        if snap_rows and today <= utc_today:
+            return _build_fast_from_snapshot(ws, today, snap_rows)
+
+        # Upcoming day (or no snapshot): queue depth is the right "left".
         live = send_schedule.plan_from_sending_schedules(ws, today)
         if live is None:
-            # Outside the 3-day window (or aggregate failed) — page the queue.
             logger.info(
                 f"sending-schedules unavailable for {ws['id']} {today}; "
                 f"falling back to scheduled-emails paging"
@@ -291,9 +316,9 @@ def _get_workspace_schedule(
 ) -> Dict[str, Any]:
     """Cached per-workspace schedule (stale-while-revalidate).
 
-    Remaining comes from Bison's sending-schedules aggregate (one call). Far-
-    future days with a Supabase pre-capture skip Bison entirely. Queue paging
-    is only a fallback.
+    Current/past days with a midnight snapshot use plan − sent progress.
+    Upcoming days use sending-schedules / queue depth. Far-future days with
+    a Supabase pre-capture skip Bison entirely.
     """
     cache_key = f"schedule_today:{ws['id']}:{today}"
 
@@ -303,15 +328,12 @@ def _get_workspace_schedule(
 
     cached, fresh = _cache_get_stale(cache_key)
     if fresh:
-        if cached.get("approximate"):
-            _cache_revalidate(cache_key, build_live, _SCHEDULE_CACHE_TTL)
         return cached
     if cached is not None:
         _cache_revalidate(cache_key, build_live, _SCHEDULE_CACHE_TTL)
         return cached
 
-    # Cold cache — sending-schedules is itself one cheap call, so build live
-    # directly. Far-future snapshot-only days stay on Supabase.
+    # Cold cache. Far-future snapshot-only days stay on Supabase.
     if (
         snap_rows
         and today > utc_today
@@ -338,10 +360,10 @@ def schedule_today(workspace_id: Optional[str] = None, date: Optional[str] = Non
     """Sending schedule for one UTC send day, per campaign and per inbox.
 
     Defaults to the current UTC day; pass `date` (YYYY-MM-DD) for another day.
-    Remaining uses Bison's /campaigns/sending-schedules aggregate
-    (emails_being_sent) for today/tomorrow/day_after_tomorrow — one call per
-    workspace. Midnight snapshot supplies plan_total; workspace chart stats
-    supply sent_total.
+
+    For the current/past day: plan_total from the midnight snapshot, sent_total
+    from workspace chart stats, remaining_total = max(plan − min(sent, plan), 0).
+    Upcoming days report queue depth (sending-schedules / scheduled-emails).
 
     Each workspace is cached ~10 minutes independently. Omitting workspace_id
     (or passing "all") sums those same cached entries, so all == v1 + v2.

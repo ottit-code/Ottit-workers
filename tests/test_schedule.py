@@ -137,7 +137,13 @@ def test_merge_workspaces_sums_to_all():
         "sent_total": 90,
         "approximate": False,
         "campaigns": [
-            {"campaign_id": "a", "planned_today": 100, "workspace_id": "ws_v1"},
+            {
+                "campaign_id": "a",
+                "planned_today": 110,
+                "planned_start": 200,
+                "sent_today": 90,
+                "workspace_id": "ws_v1",
+            },
         ],
     }
     v2 = {
@@ -148,19 +154,29 @@ def test_merge_workspaces_sums_to_all():
         "overdue_total": 446,
         "plan_total": 6000,
         "sent_total": 200,
-        "approximate": True,
+        "approximate": False,
         "campaigns": [
-            {"campaign_id": "b", "planned_today": 5341, "workspace_id": "ws_v2"},
+            {
+                "campaign_id": "b",
+                "planned_today": 5800,
+                "planned_start": 6000,
+                "sent_today": 200,
+                "workspace_id": "ws_v2",
+            },
         ],
     }
 
     all_ws = _merge_workspaces([v1, v2], "2026-08-01")
 
-    assert all_ws["remaining_total"] == 100 + 5341
-    assert all_ws["planned_total"] == 100 + 5341
+    # Workspace totals use closed identity on summed plan/sent.
     assert all_ws["plan_total"] == 200 + 6000
     assert all_ws["sent_total"] == 90 + 200
+    assert all_ws["remaining_total"] == (200 + 6000) - (90 + 200)
+    assert all_ws["planned_total"] == all_ws["remaining_total"]
     assert all_ws["overdue_total"] == 10 + 446
-    assert all_ws["approximate"] is True
+    assert all_ws["approximate"] is False
     assert len(all_ws["campaigns"]) == 2
     assert all_ws["generated_at"] == "2026-08-01T12:05:00+00:00"
+    by_id = {c["campaign_id"]: c for c in all_ws["campaigns"]}
+    assert by_id["a"]["planned_today"] == 110  # 200 - 90
+    assert by_id["b"]["planned_today"] == 5800  # 6000 - 200

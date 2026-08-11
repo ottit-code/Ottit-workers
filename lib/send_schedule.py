@@ -311,26 +311,31 @@ def campaign_sent_on_day(client, campaign_id: str, day: str) -> Optional[int]:
 
 
 def plan_from_snapshot(ws: dict, day: str, snapshot_rows: List[dict]) -> List[Dict[str, Any]]:
-    """Approximate schedule view derived from the midnight plan snapshot.
+    """Plan-progress view from the midnight snapshot + per-campaign sent.
 
-    remaining ≈ planned - sent_today per campaign. This OVERCOUNTS when Bison
-    still holds overdue items (slot passed, will roll to later days) — prefer
-    plan_for_workspace for exact remaining. Kept as a fallback when live queue
-    paging fails. Inbox breakdowns show the *planned* midnight split.
+    LEFT = max(planned − min(sent_today, planned), 0) — closed identity with
+    PLAN/SENT for Daily Review. Inbox breakdowns show the midnight planned
+    split (not live remaining).
     """
+    from lib import plan_progress
+
     client = emailbison.for_workspace(ws["id"])
 
     def one(row: dict) -> Dict[str, Any]:
         cid = str(row["campaign_id"])
         planned = int(row.get("planned") or 0)
         sent = campaign_sent_on_day(client, cid, day)
-        remaining = max(planned - sent, 0) if sent is not None else planned
+        remaining = (
+            plan_progress.left_of_plan(planned, sent)
+            if sent is not None
+            else planned
+        )
         return {
             "workspace_id": ws["id"],
             "workspace_name": ws["name"],
             "campaign_id": cid,
             "campaign_name": row.get("campaign_name") or "",
-            "planned_today": remaining,
+            "planned_today": remaining if remaining is not None else planned,
             "planned_start": planned,
             "sent_today": sent,
             "overdue_today": None,  # unknown without queue paging
