@@ -16,6 +16,7 @@ wins when set (must be a known Ottit workspace id).
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -227,6 +228,34 @@ def ingest_spamcheck_webhook(
 
 
 # ---------------------------------------------------------------------------
+# Keep-list — only these six InboxAssure tests are shown
+# ---------------------------------------------------------------------------
+# Ops keep-list (Aug 2026). Names in IA look like:
+#   EB: Ottit: CI-DED-Set6-05/18: MWF
+#   EB: Ottit: SM-GOOG-Set3-08/12: MWF
+# Slash in the date stamp is optional (05/18 vs 0518). Set1/Set2 dates
+# may appear as 06/0, 06/09, or 0609.
+
+_ALLOWED_IA_TEST_PATTERNS = (
+    re.compile(r"ci[-_]?ded[-_]?set6[-_/]?05/?18", re.I),
+    re.compile(r"ci[-_]?ded[-_]?set5[-_/]?05/?18", re.I),
+    re.compile(r"ci[-_]?ded[-_]?set4[-_/]?05/?18", re.I),
+    re.compile(r"sm[-_]?goog[-_]?set3[-_/]?08/?12", re.I),
+    re.compile(r"sm[-_]?goog[-_]?set2[-_/]?06/?0(?:9)?(?!\d)", re.I),
+    re.compile(r"sm[-_]?goog[-_]?set1[-_/]?06/?0(?:9)?(?!\d)", re.I),
+)
+
+_IA_LIST_FETCH_CAP = 200
+
+
+def is_kept_ia_spamcheck_name(name: Optional[str]) -> bool:
+    """True only for the six current InboxAssure seed-set tests."""
+    if not name or not str(name).strip():
+        return False
+    return any(p.search(str(name)) for p in _ALLOWED_IA_TEST_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
 # Read helpers (dashboard)
 # ---------------------------------------------------------------------------
 
@@ -260,7 +289,10 @@ def list_spamchecks(
     workspace_id: Optional[str] = None,
     limit: int = 50,
 ) -> list[dict]:
-    """Latest spamcheck runs, newest first. Workspace-scoped when provided."""
+    """Latest kept spamcheck runs, newest first. Workspace-scoped when provided.
+
+    Extra InboxAssure tests are dropped; only the six seed-set names remain.
+    """
     if limit < 1:
         limit = 1
     if limit > 200:
@@ -272,11 +304,13 @@ def list_spamchecks(
         .table("inboxassure_spamchecks")
         .select(_SPAMCHECK_LIST_COLS)
         .order("ia_updated_at", desc=True)
-        .limit(limit)
+        .limit(_IA_LIST_FETCH_CAP)
     )
     if ws:
         query = query.eq("workspace_id", ws)
-    return query.execute().data or []
+    rows = query.execute().data or []
+    kept = [r for r in rows if is_kept_ia_spamcheck_name(r.get("name"))]
+    return kept[:limit]
 
 
 def get_spamcheck(ia_spamcheck_id: int) -> Optional[dict]:
@@ -294,6 +328,10 @@ def get_spamcheck(ia_spamcheck_id: int) -> Optional[dict]:
     if not parent_rows:
         return None
 
+    run = dict(parent_rows[0])
+    if not is_kept_ia_spamcheck_name(run.get("name")):
+        return None
+
     reports = (
         sb.table("inboxassure_spamcheck_reports")
         .select(_SPAMCHECK_REPORT_COLS)
@@ -303,6 +341,5 @@ def get_spamcheck(ia_spamcheck_id: int) -> Optional[dict]:
         .data
         or []
     )
-    run = dict(parent_rows[0])
     run["reports"] = reports
     return run

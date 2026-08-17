@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from lib.inboxassure_spamcheck import (
+    is_kept_ia_spamcheck_name,
     parse_spamcheck_payload,
     resolve_workspace_id,
     upsert_spamcheck,
@@ -228,7 +229,15 @@ def test_list_spamchecks_scopes_workspace():
             return self
 
         def execute(self):
-            return MagicMock(data=[{"ia_spamcheck_id": 1, "workspace_id": "ws_v2"}])
+            return MagicMock(
+                data=[
+                    {
+                        "ia_spamcheck_id": 1,
+                        "workspace_id": "ws_v2",
+                        "name": "EB: Ottit: SM-GOOG-Set3-08/12: MWF",
+                    }
+                ]
+            )
 
     q = _Query()
     sb = MagicMock()
@@ -241,12 +250,66 @@ def test_list_spamchecks_scopes_workspace():
     assert q.filters["workspace_id"] == "ws_v2"
 
 
+def test_kept_ia_spamcheck_names():
+    keep = [
+        "EB: Ottit: CI-DED-Set6-05/18: MWF",
+        "EB: Ottit: CI-DED-Set5-05/18: MWF",
+        "EB: Ottit: CI-DED-Set4-05/18: MWF",
+        "EB: Ottit: SM-GOOG-Set3-08/12: MWF",
+        "EB: Ottit: SM-GOOG-Set2-06/0: MWF",
+        "EB: Ottit: SM-GOOG-Set1-06/09: MWF",
+    ]
+    drop = [
+        None,
+        "",
+        "Ottit: SM-GOOG-SET3-0609: MWF Check",
+        "EB: Ottit: CI-DED-Set3-05/18: MWF",
+        "EB: Ottit: SM-GOOG-Set4-08/12: MWF",
+        "Random placement test",
+    ]
+    for name in keep:
+        assert is_kept_ia_spamcheck_name(name), name
+    for name in drop:
+        assert not is_kept_ia_spamcheck_name(name), name
+
+
+def test_list_spamchecks_drops_non_keep_tests():
+    from lib.inboxassure_spamcheck import list_spamchecks
+
+    class _Query:
+        def select(self, *_a, **_k):
+            return self
+
+        def order(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
+            return self
+
+        def execute(self):
+            return MagicMock(
+                data=[
+                    {"ia_spamcheck_id": 1, "name": "Ottit: SM-GOOG-SET3-0609: MWF Check"},
+                    {"ia_spamcheck_id": 2, "name": "EB: Ottit: CI-DED-Set6-05/18: MWF"},
+                    {"ia_spamcheck_id": 3, "name": "Unrelated test"},
+                ]
+            )
+
+    sb = MagicMock()
+    sb.table.return_value = _Query()
+
+    with patch("lib.inboxassure_spamcheck.get_supabase", return_value=sb):
+        rows = list_spamchecks(limit=10)
+
+    assert [r["ia_spamcheck_id"] for r in rows] == [2]
+
+
 def test_get_spamcheck_includes_reports():
     from lib.inboxassure_spamcheck import get_spamcheck
 
     parent = {
         "ia_spamcheck_id": 1179,
-        "name": "Ottit: SM-GOOG-SET3-0609: MWF Check",
+        "name": "EB: Ottit: SM-GOOG-Set3-08/12: MWF",
         "workspace_id": "ws_v2",
     }
     reports = [
@@ -291,6 +354,50 @@ def test_get_spamcheck_includes_reports():
     assert run is not None
     assert run["ia_spamcheck_id"] == 1179
     assert len(run["reports"]) == 2
+
+
+def test_get_spamcheck_hides_wiped_tests():
+    from lib.inboxassure_spamcheck import get_spamcheck
+
+    parent = {
+        "ia_spamcheck_id": 99,
+        "name": "Ottit: SM-GOOG-SET3-0609: MWF Check",
+        "workspace_id": "ws_v2",
+    }
+
+    class _ParentQ:
+        def select(self, *_a, **_k):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
+            return self
+
+        def execute(self):
+            return MagicMock(data=[parent])
+
+    class _ReportQ:
+        def select(self, *_a, **_k):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        def order(self, *_a, **_k):
+            return self
+
+        def execute(self):
+            return MagicMock(data=[])
+
+    sb = MagicMock()
+    sb.table.side_effect = lambda name: (
+        _ParentQ() if name == "inboxassure_spamchecks" else _ReportQ()
+    )
+
+    with patch("lib.inboxassure_spamcheck.get_supabase", return_value=sb):
+        assert get_spamcheck(99) is None
 
 
 def test_list_spamchecks_endpoint(client):
