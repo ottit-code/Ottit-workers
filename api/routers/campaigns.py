@@ -59,25 +59,44 @@ class Campaign(BaseModel):
     created_at: Optional[str] = None
     opened_count: int = Field(0, description="Total opens (not unique) from EmailBison.")
     unique_opens_count: int = Field(0, description="Unique opens from EmailBison.")
+    total_leads_contacted: int = Field(
+        0, description="Leads who received at least one email (EmailBison)."
+    )
     interested_count: int = Field(0, description="Leads marked interested.")
     booked_count: int = Field(0, description="Leads with a confirmed meeting. Equals interested_count until calendar integration ships.")
     last_sent_at: Optional[str] = Field(None, description="Timestamp of most recent send activity on the campaign (EmailBison updated_at).")
 
 
+def _as_int(val: Any, default: int = 0) -> int:
+    try:
+        return int(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_campaign(c: dict) -> dict:
-    interested = int(c.get("interested") or 0)
+    interested = _as_int(c.get("interested"))
+    # Bison UI reply rate is unique replies ÷ leads contacted, not replies ÷
+    # emails sent (sequences send multiple emails per lead).
+    unique_replies = c.get("unique_replies")
+    reply_count = (
+        _as_int(unique_replies)
+        if unique_replies is not None
+        else _as_int(c.get("replied"))
+    )
     return {
         "campaign_id": str(c.get("id")),
         "campaign_name": c.get("name", ""),
         "campaign_status": str(c.get("status") or "unknown").lower(),
-        "emails_sent_count": int(c.get("emails_sent") or 0),
-        "reply_count": int(c.get("replied") or 0),
-        "bounced_count": int(c.get("bounced") or 0),
-        "total_leads": int(c.get("total_leads") or 0),
+        "emails_sent_count": _as_int(c.get("emails_sent")),
+        "reply_count": reply_count,
+        "bounced_count": _as_int(c.get("bounced")),
+        "total_leads": _as_int(c.get("total_leads")),
+        "total_leads_contacted": _as_int(c.get("total_leads_contacted")),
         "completion_percentage": float(c.get("completion_percentage") or 0),
         "created_at": c.get("created_at"),
-        "opened_count": int(c.get("opened") or 0),
-        "unique_opens_count": int(c.get("unique_opens") or 0),
+        "opened_count": _as_int(c.get("opened")),
+        "unique_opens_count": _as_int(c.get("unique_opens")),
         "interested_count": interested,
         "booked_count": interested,
         "last_sent_at": c.get("updated_at"),

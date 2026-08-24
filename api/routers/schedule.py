@@ -63,6 +63,22 @@ def _apply_plan_progress_to_campaigns(campaigns: List[Dict[str, Any]]) -> None:
             c["planned_today"] = left
 
 
+def sent_total_from_campaigns(campaigns: List[Dict[str, Any]]) -> Optional[int]:
+    """Sum per-campaign chart sent when every campaign has a lookup.
+
+    Workspace chart "Sent" can include warmup and other non-plan mail, which
+    makes the Daily Review header look like SENT >> PLAN (Abdullah Aug 21:
+    4,108 sent vs 2,347 plan). Campaign-chart sum stays in the same universe
+    as the midnight plan snapshot.
+    """
+    if not campaigns:
+        return 0
+    vals = [c.get("sent_today") for c in campaigns]
+    if any(v is None for v in vals):
+        return None
+    return sum(int(v or 0) for v in vals)
+
+
 def _finalize(
     campaigns: List[Dict[str, Any]],
     *,
@@ -165,7 +181,12 @@ def _build_fast_from_snapshot(
         cap = r.get("captured_at")
         if cap and (snapshot_at is None or cap > snapshot_at):
             snapshot_at = cap
-    sent_total = send_schedule.sent_today_for_workspace(ws["id"], today)
+    campaign_sent = sent_total_from_campaigns(campaigns)
+    sent_total = (
+        campaign_sent
+        if campaign_sent is not None
+        else send_schedule.sent_today_for_workspace(ws["id"], today)
+    )
     return _finalize(
         campaigns,
         today=today,

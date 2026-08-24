@@ -4,7 +4,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-from api.routers.schedule import _merge_live_with_snapshot, _merge_workspaces
+from api.routers.schedule import (
+    _merge_live_with_snapshot,
+    _merge_workspaces,
+    sent_total_from_campaigns,
+)
 from lib.send_schedule import relative_schedule_day, plan_from_sending_schedules
 
 
@@ -180,3 +184,21 @@ def test_merge_workspaces_sums_to_all():
     by_id = {c["campaign_id"]: c for c in all_ws["campaigns"]}
     assert by_id["a"]["planned_today"] == 110  # 200 - 90
     assert by_id["b"]["planned_today"] == 5800  # 6000 - 200
+
+
+def test_sent_total_sums_campaign_charts_not_workspace():
+    """Header SENT must match campaign rows, not workspace chart + warmup."""
+    campaigns = [
+        {"campaign_id": "a", "sent_today": 900},
+        {"campaign_id": "b", "sent_today": 1447},
+    ]
+    assert sent_total_from_campaigns(campaigns) == 2347
+
+
+def test_sent_total_falls_back_when_a_lookup_failed():
+    campaigns = [
+        {"campaign_id": "a", "sent_today": 900},
+        {"campaign_id": "b", "sent_today": None},
+    ]
+    assert sent_total_from_campaigns(campaigns) is None
+    assert sent_total_from_campaigns([]) == 0
